@@ -10,6 +10,7 @@
  */
 
 #include "oro_mot_adapter.h"
+#include "sqlite3.h"
 
 #include <cstdio>
 #include <cstring>
@@ -77,9 +78,15 @@ static thread_local bool tl_mot_initialized = false;
 
 // Per-connection state (one per sqlite3*)
 struct OroMotConn {
-    SessionContext* session = nullptr;
-    TxnManager*    txn      = nullptr;
-    bool           in_txn   = false;
+    SessionContext* session      = nullptr;
+    TxnManager*    txn           = nullptr;
+    bool           in_txn        = false;
+    // WAL state
+    bool           wal_enabled   = false;
+    bool           wal_replaying = false;  // suppress WAL writes during replay
+    void*          pDb           = nullptr;  // sqlite3* for executing WAL SQL
+    void*          ins_stmt      = nullptr;  // prepared INSERT for WAL
+    void*          del_stmt      = nullptr;  // prepared DELETE marker for WAL
 };
 
 // Table registry: (iDb, table_name) → MOT::Table*
@@ -161,6 +168,8 @@ struct OroMotCursor {
     int64_t          current_rowid = 0;
     bool             at_eof      = true;
     bool             write_mode  = false;
+    // --- Identity (for WAL logging) ---
+    std::string      table_name;             // original SQLite table name
     // --- Index cursor fields ---
     bool             is_index    = false;
     int64_t          idx_rowid   = 0;       // rowid from current index entry
@@ -241,6 +250,7 @@ static OroMotConn* GetOrCreateConn(void* pDb) {
     auto* c = new OroMotConn();
     c->session = sess;
     c->txn = sess->GetTxnManager();
+    c->pDb = pDb;
     g.conns[pDb] = c;
 
     EnsureThreadCtx(c);
@@ -501,6 +511,7 @@ extern "C" int oroMotCursorOpen(void* pDb, int iDb, const char* table_name,
     cur->conn = c;
     cur->write_mode = (wrFlag != 0);
     cur->at_eof = true;
+    cur->table_name = table_name ? table_name : "";
 
     *ppCursor = cur;
     return 0;
@@ -705,6 +716,11 @@ extern "C" const void* oroMotPayloadFetch(OroMotCursor* pCur, uint32_t* pAmt) {
     return p + sizeof(uint32_t);
 }
 
+// Forward decl
+static int WalLogInsert(OroMotConn* c, const char* tab, int64_t rowid,
+                        const void* pData, int nData);
+static int WalLogDelete(OroMotConn* c, const char* tab, int64_t rowid);
+
 extern "C" int oroMotInsert(OroMotCursor* pCur, int64_t rowid,
                             const void* pData, int nData) {
     EnsureThreadCtx(pCur->conn);
@@ -713,13 +729,14 @@ extern "C" int oroMotInsert(OroMotCursor* pCur, int64_t rowid,
         return 1;  // record too large
     }
 
+    // Log to WAL BEFORE touching MOT. SQLite's txn coordinates durability.
+    if (pCur->conn->wal_enabled && !pCur->conn->wal_replaying) {
+        WalLogInsert(pCur->conn, pCur->table_name.c_str(), rowid, pData, nData);
+    }
+
     Row* row = pCur->table->CreateNewRow();
     if (!row) return 1;
 
-    // Pack: [4-byte size][record bytes...]
-    // Use SetStringValue (friend helper) to write to the column at the correct
-    // offset. SetValueVariable has a known bug in MOT (writes at fieldSize
-    // instead of field offset) so we avoid it.
     char buf[MAX_RECORD_SIZE];
     memset(buf, 0, sizeof(buf));
     uint32_t sz = (uint32_t)nData;
@@ -727,15 +744,11 @@ extern "C" int oroMotInsert(OroMotCursor* pCur, int64_t rowid,
     memcpy(buf + sizeof(uint32_t), pData, nData);
     SetStringValue(row, MOT_COL_DATA, buf);
 
-    // Set rowid column AND InternalKey (with htobe64 for MassTree byte ordering)
     row->SetValue<uint64_t>(MOT_COL_ROWID, (uint64_t)rowid);
     row->SetInternalKey(MOT_COL_ROWID, htobe64((uint64_t)rowid));
 
     RC rc = pCur->table->InsertRow(row, pCur->conn->txn);
     if (rc != RC_OK) {
-        /* Do NOT DestroyRow on failure: MOT's InsertRow may have registered
-         * the row with the transaction's access manager. Destroying it here
-         * leads to a double-free on rollback. */
         return (rc == RC_UNIQUE_VIOLATION) ? 2 : 1;
     }
     return 0;
@@ -745,11 +758,12 @@ extern "C" int oroMotDelete(OroMotCursor* pCur) {
     EnsureThreadCtx(pCur->conn);
     if (pCur->at_eof || !pCur->current_row) return 1;
 
-    // Need to look up via RD_FOR_UPDATE to mark for deletion
+    int64_t rowid_to_delete = pCur->current_rowid;
+
     Key* key = pCur->index->CreateNewSearchKey();
     if (!key) return 1;
     key->FillPattern(0x00, key->GetKeyLength(), 0);
-    uint64_t be_val = htobe64((uint64_t)pCur->current_rowid);
+    uint64_t be_val = htobe64((uint64_t)rowid_to_delete);
     key->FillValue(reinterpret_cast<const uint8_t*>(&be_val), sizeof(uint64_t), 0);
 
     RC rc = RC_OK;
@@ -760,7 +774,12 @@ extern "C" int oroMotDelete(OroMotCursor* pCur) {
     if (rc != RC_OK || !r) return 1;
 
     rc = pCur->conn->txn->DeleteLastRow();
-    return (rc == RC_OK) ? 0 : 1;
+    if (rc != RC_OK) return 1;
+
+    if (pCur->conn->wal_enabled && !pCur->conn->wal_replaying) {
+        WalLogDelete(pCur->conn, pCur->table_name.c_str(), rowid_to_delete);
+    }
+    return 0;
 }
 
 extern "C" int oroMotCount(OroMotCursor* pCur, int64_t* pCount) {
@@ -1442,4 +1461,195 @@ extern "C" int oroMotIdxSeek(OroMotCursor* pCur,
 
     *pEof = pCur->at_eof ? 1 : 0;
     return 0;
+}
+
+// =====================================================================
+// Write-Ahead Log via native SQLite table
+// =====================================================================
+//
+// Design: Every MOT row mutation is mirrored into a native SQLite table
+// named `_mot_wal` in the same database file. SQLite's own durability
+// (rollback journal / WAL mode on its .db file) makes the log crash-safe.
+//
+// Schema:
+//   CREATE TABLE _mot_wal (
+//     seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+//     table_name TEXT,
+//     op         INTEGER,   -- 1=INS, 2=DEL
+//     rowid      INTEGER,
+//     record     BLOB
+//   )
+//
+// Write ordering (per user txn):
+//   (1) INSERT row into _mot_wal    ← buffered in SQLite txn
+//   (2) Table::InsertRow into MOT   ← in-memory
+//   (3) user COMMIT                 ← SQLite fsyncs _mot_wal atomically
+//   (4) MOT commit                  ← in-memory, cannot fail durably
+//
+// If we crash between (3) and (4): on restart, _mot_wal has the record,
+// MOT does not — replay applies it. Correct.
+// If we crash between (1) and (3): SQLite rolls back _mot_wal, MOT rolls
+// back its staged change. Nothing persisted. Correct.
+//
+// The WAL rows live in the same .db file as the SQLite-side schema and
+// native tables, so one fsync durably commits everything.
+// =====================================================================
+
+#define WAL_OP_INS 1
+#define WAL_OP_DEL 2
+
+static const char* WAL_DDL =
+    "CREATE TABLE IF NOT EXISTS _mot_wal ("
+    "  seq        INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  table_name TEXT NOT NULL,"
+    "  op         INTEGER NOT NULL,"
+    "  rowid      INTEGER NOT NULL,"
+    "  record     BLOB)";
+
+static const char* WAL_INS_SQL =
+    "INSERT INTO _mot_wal(table_name, op, rowid, record) VALUES(?1, ?2, ?3, ?4)";
+
+static int WalLogInsert(OroMotConn* c, const char* tab, int64_t rowid,
+                        const void* pData, int nData) {
+    if (!c || !c->wal_enabled || !c->ins_stmt) return 1;
+    sqlite3_stmt* stmt = (sqlite3_stmt*)c->ins_stmt;
+    sqlite3_reset(stmt);
+    sqlite3_bind_text(stmt, 1, tab, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 2, WAL_OP_INS);
+    sqlite3_bind_int64(stmt, 3, rowid);
+    sqlite3_bind_blob(stmt, 4, pData, nData, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    return (rc == SQLITE_DONE) ? 0 : 1;
+}
+
+static int WalLogDelete(OroMotConn* c, const char* tab, int64_t rowid) {
+    if (!c || !c->wal_enabled || !c->ins_stmt) return 1;
+    sqlite3_stmt* stmt = (sqlite3_stmt*)c->ins_stmt;
+    sqlite3_reset(stmt);
+    sqlite3_bind_text(stmt, 1, tab, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 2, WAL_OP_DEL);
+    sqlite3_bind_int64(stmt, 3, rowid);
+    sqlite3_bind_null(stmt, 4);
+    int rc = sqlite3_step(stmt);
+    return (rc == SQLITE_DONE) ? 0 : 1;
+}
+
+extern "C" int oroMotWalEnable(void* pDb) {
+    if (!pDb) return 1;
+    sqlite3* db = (sqlite3*)pDb;
+    OroMotConn* c = GetOrCreateConn(pDb);
+    if (!c) return 1;
+
+    // Create WAL table
+    char* err = nullptr;
+    if (sqlite3_exec(db, WAL_DDL, nullptr, nullptr, &err) != SQLITE_OK) {
+        if (err) sqlite3_free(err);
+        return 1;
+    }
+
+    // Prepare the INSERT statement (reused across all logging)
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, WAL_INS_SQL, -1, &stmt, nullptr) != SQLITE_OK) {
+        return 1;
+    }
+    c->ins_stmt = stmt;
+    c->wal_enabled = true;
+    return 0;
+}
+
+extern "C" int oroMotWalIsEnabled(void* pDb) {
+    auto& g = globals();
+    std::lock_guard<std::mutex> lock(g.mu);
+    auto it = g.conns.find(pDb);
+    if (it == g.conns.end()) return 0;
+    return it->second->wal_enabled ? 1 : 0;
+}
+
+extern "C" int oroMotWalRecover(void* pDb) {
+    if (!pDb) return -1;
+    sqlite3* db = (sqlite3*)pDb;
+
+    // Check if the WAL table exists (if not, nothing to do)
+    sqlite3_stmt* check = nullptr;
+    const char* chkSql = "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='_mot_wal'";
+    if (sqlite3_prepare_v2(db, chkSql, -1, &check, nullptr) != SQLITE_OK) return -1;
+    int hasWal = (sqlite3_step(check) == SQLITE_ROW) ? 1 : 0;
+    sqlite3_finalize(check);
+    if (!hasWal) return 0;
+
+    OroMotConn* c = GetOrCreateConn(pDb);
+    if (!c) return -1;
+
+    // Read all WAL entries in order
+    sqlite3_stmt* sel = nullptr;
+    const char* selSql =
+        "SELECT seq, table_name, op, rowid, record FROM _mot_wal ORDER BY seq";
+    if (sqlite3_prepare_v2(db, selSql, -1, &sel, nullptr) != SQLITE_OK) return -1;
+
+    EnsureThreadCtx(c);
+    c->wal_replaying = true;  // suppress re-logging during replay
+
+    // Replay each record in its own MOT transaction so subsequent operations
+    // see the committed state (avoids RYOW issue within the replay itself).
+    int applied = 0;
+    int rc = 0;
+    while (sqlite3_step(sel) == SQLITE_ROW) {
+        const char* tab = (const char*)sqlite3_column_text(sel, 1);
+        int op = sqlite3_column_int(sel, 2);
+        int64_t rowid = sqlite3_column_int64(sel, 3);
+        const void* rec = sqlite3_column_blob(sel, 4);
+        int nRec = sqlite3_column_bytes(sel, 4);
+        if (!tab) continue;
+
+        // Start a fresh MOT transaction for this record
+        if (!c->in_txn) {
+            c->txn->StartTransaction(c->txn->GetTransactionId(), READ_COMMITED);
+            c->in_txn = true;
+        }
+
+        OroMotCursor* cur = nullptr;
+        if (oroMotCursorOpen(pDb, 0, tab, 1, &cur) != 0) {
+            if (c->in_txn) {
+                c->txn->Rollback();
+                c->txn->EndTransaction();
+                c->in_txn = false;
+            }
+            continue;
+        }
+
+        bool ok = false;
+        if (op == WAL_OP_INS) {
+            int ir = oroMotInsert(cur, rowid, rec, nRec);
+            // rc=2 means UNIQUE violation — idempotent: row already in MOT
+            // (e.g. leftover state from same process, or partial replay).
+            ok = (ir == 0 || ir == 2);
+        } else if (op == WAL_OP_DEL) {
+            int res = 0;
+            if (oroMotSeekRowid(cur, rowid, &res) == 0 && res == 0) {
+                ok = (oroMotDelete(cur) == 0);
+            } else {
+                ok = true;  // already gone — idempotent
+            }
+        }
+
+        oroMotCursorClose(cur);
+
+        // Commit this record's transaction
+        if (c->in_txn) {
+            RC mrc = c->txn->Commit();
+            c->txn->EndTransaction();
+            c->in_txn = false;
+            if (mrc != RC_OK) ok = false;
+        }
+
+        if (ok) applied++;
+    }
+    sqlite3_finalize(sel);
+
+    c->wal_replaying = false;
+
+    // Clear the replayed entries (they're now in MOT)
+    sqlite3_exec(db, "DELETE FROM _mot_wal", nullptr, nullptr, nullptr);
+
+    return (rc == 0) ? applied : -1;
 }

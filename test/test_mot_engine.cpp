@@ -554,6 +554,227 @@ static void TestReadYourOwnWrites() {
 }
 
 // =====================================================================
+// Backup/restore tests (WAL persistence)
+// =====================================================================
+
+// Unique temp DB path per test, cleaned up on open
+static std::string TempDbPath(const char* name) {
+    char buf[PATH_MAX];
+    snprintf(buf, sizeof(buf), "/tmp/motlite_test_%s_%d.db", name, getpid());
+    unlink(buf);
+    // also clean up sidecar files
+    std::string wal = std::string(buf) + "-wal";
+    std::string journal = std::string(buf) + "-journal";
+    std::string shm = std::string(buf) + "-shm";
+    unlink(wal.c_str());
+    unlink(journal.c_str());
+    unlink(shm.c_str());
+    return buf;
+}
+
+// Open a file-backed DB with WAL enabled and recovery run
+static sqlite3* OpenPersistent(const char* path) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(path, &db) != SQLITE_OK) return nullptr;
+    if (oroMotWalEnable(db) != 0) { sqlite3_close(db); return nullptr; }
+    oroMotWalRecover(db);  // no-op on first open, replays on subsequent opens
+    return db;
+}
+
+static void TestWalBasic() {
+    std::string path = TempDbPath("basic");
+
+    // Session 1: create table, insert 3 rows, close
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        TEST_ASSERT(db != nullptr, "open 1");
+        auto r = ExecSql(db,
+            "CREATE MOT TABLE twal_basic (id INTEGER PRIMARY KEY, name TEXT)");
+        TEST_ASSERT(r.rc == SQLITE_OK, "create");
+        ExecSql(db, "INSERT INTO twal_basic VALUES(1, 'Alice')");
+        ExecSql(db, "INSERT INTO twal_basic VALUES(2, 'Bob')");
+        ExecSql(db, "INSERT INTO twal_basic VALUES(3, 'Charlie')");
+        r = ExecSql(db, "SELECT count(*) FROM twal_basic");
+        TEST_ASSERT(r.rows[0][0] == "3", "3 rows before close");
+        sqlite3_close(db);
+    }
+
+    // Session 2: reopen, data must be there
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        TEST_ASSERT(db != nullptr, "open 2");
+        auto r = ExecSql(db, "SELECT count(*) FROM twal_basic");
+        TEST_ASSERT(r.rc == SQLITE_OK, "select count");
+        TEST_ASSERT(r.rows[0][0] == "3", "3 rows after reopen");
+
+        r = ExecSql(db, "SELECT name FROM twal_basic WHERE id = 2");
+        TEST_ASSERT(r.rows.size() == 1, "point lookup after reopen");
+        TEST_ASSERT(r.rows[0][0] == "Bob", "correct value after reopen");
+        sqlite3_close(db);
+    }
+    unlink(path.c_str());
+}
+
+static void TestWalMultipleTables() {
+    std::string path = TempDbPath("multi");
+
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        ExecSql(db, "CREATE MOT TABLE twal_users (id INTEGER PRIMARY KEY, name TEXT)");
+        ExecSql(db, "CREATE MOT TABLE twal_orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)");
+        // Also a native table — should coexist
+        ExecSql(db, "CREATE TABLE twal_audit (id INTEGER PRIMARY KEY, msg TEXT)");
+        ExecSql(db, "INSERT INTO twal_users VALUES(1, 'Alice')");
+        ExecSql(db, "INSERT INTO twal_users VALUES(2, 'Bob')");
+        ExecSql(db, "INSERT INTO twal_orders VALUES(100, 1, 99.99)");
+        ExecSql(db, "INSERT INTO twal_orders VALUES(101, 2, 75.50)");
+        ExecSql(db, "INSERT INTO twal_audit VALUES(1, 'initial')");
+        sqlite3_close(db);
+    }
+
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        auto r = ExecSql(db, "SELECT count(*) FROM twal_users");
+        TEST_ASSERT(r.rows[0][0] == "2", "2 users after reopen");
+        r = ExecSql(db, "SELECT count(*) FROM twal_orders");
+        TEST_ASSERT(r.rows[0][0] == "2", "2 orders after reopen");
+        r = ExecSql(db, "SELECT count(*) FROM twal_audit");
+        TEST_ASSERT(r.rows[0][0] == "1", "1 audit row after reopen");
+
+        // Cross-engine JOIN after reopen
+        r = ExecSql(db, "SELECT u.name, o.total FROM twal_users u "
+                       "JOIN twal_orders o ON u.id = o.user_id ORDER BY u.id");
+        TEST_ASSERT(r.rows.size() == 2, "2 join rows after reopen");
+        TEST_ASSERT(r.rows[0][0] == "Alice", "join alice");
+        TEST_ASSERT(r.rows[1][0] == "Bob", "join bob");
+        sqlite3_close(db);
+    }
+    unlink(path.c_str());
+}
+
+static void TestWalDeletes() {
+    std::string path = TempDbPath("deletes");
+
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        ExecSql(db, "CREATE MOT TABLE twal_del (id INTEGER PRIMARY KEY, val INTEGER)");
+        for (int i = 1; i <= 10; i++) {
+            char sql[128];
+            snprintf(sql, sizeof(sql),
+                     "INSERT INTO twal_del VALUES(%d, %d)", i, i * 10);
+            ExecSql(db, sql);
+        }
+        ExecSql(db, "DELETE FROM twal_del WHERE id > 5");  // delete 6..10
+        auto r = ExecSql(db, "SELECT count(*) FROM twal_del");
+        TEST_ASSERT(r.rows[0][0] == "5", "5 rows before close");
+        sqlite3_close(db);
+    }
+
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        auto r = ExecSql(db, "SELECT count(*) FROM twal_del");
+        TEST_ASSERT(r.rows[0][0] == "5", "5 rows after reopen (deletes honored)");
+
+        r = ExecSql(db, "SELECT id FROM twal_del WHERE id > 5");
+        TEST_ASSERT(r.rows.size() == 0, "no rows with id>5");
+
+        r = ExecSql(db, "SELECT val FROM twal_del WHERE id = 3");
+        TEST_ASSERT(r.rows.size() == 1, "row 3 still present");
+        TEST_ASSERT(r.rows[0][0] == "30", "row 3 correct value");
+        sqlite3_close(db);
+    }
+    unlink(path.c_str());
+}
+
+static void TestWalTransactionRollback() {
+    std::string path = TempDbPath("rollback");
+
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        ExecSql(db, "CREATE MOT TABLE twal_rb (id INTEGER PRIMARY KEY, val TEXT)");
+
+        // Autocommit insert — should persist
+        ExecSql(db, "INSERT INTO twal_rb VALUES(1, 'persistent')");
+
+        // Explicit txn that rolls back — should NOT persist
+        ExecSql(db, "BEGIN");
+        ExecSql(db, "INSERT INTO twal_rb VALUES(2, 'rolled_back')");
+        ExecSql(db, "INSERT INTO twal_rb VALUES(3, 'rolled_back')");
+        ExecSql(db, "ROLLBACK");
+
+        // Explicit txn that commits — should persist
+        ExecSql(db, "BEGIN");
+        ExecSql(db, "INSERT INTO twal_rb VALUES(4, 'committed')");
+        ExecSql(db, "COMMIT");
+
+        sqlite3_close(db);
+    }
+
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        auto r = ExecSql(db, "SELECT count(*) FROM twal_rb");
+        TEST_ASSERT(r.rows[0][0] == "2",
+                    "only 2 rows after reopen (rollback honored)");
+
+        r = ExecSql(db, "SELECT id FROM twal_rb ORDER BY id");
+        TEST_ASSERT(r.rows.size() == 2, "2 rows");
+        TEST_ASSERT(r.rows[0][0] == "1", "row 1 present");
+        TEST_ASSERT(r.rows[1][0] == "4", "row 4 present");
+
+        r = ExecSql(db, "SELECT val FROM twal_rb WHERE id = 2");
+        TEST_ASSERT(r.rows.size() == 0, "rolled-back row 2 absent");
+        sqlite3_close(db);
+    }
+    unlink(path.c_str());
+}
+
+static void TestWalSurvivesMultipleReopens() {
+    std::string path = TempDbPath("multireopen");
+
+    // Round 1: create + insert
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        ExecSql(db,
+            "CREATE MOT TABLE twal_log (id INTEGER PRIMARY KEY, msg TEXT)");
+        ExecSql(db, "INSERT INTO twal_log VALUES(1, 'round1-a')");
+        ExecSql(db, "INSERT INTO twal_log VALUES(2, 'round1-b')");
+        sqlite3_close(db);
+    }
+
+    // Round 2: reopen, add more
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        auto r = ExecSql(db, "SELECT count(*) FROM twal_log");
+        TEST_ASSERT(r.rows[0][0] == "2", "2 rows at start of round 2");
+        ExecSql(db, "INSERT INTO twal_log VALUES(3, 'round2')");
+        sqlite3_close(db);
+    }
+
+    // Round 3: reopen, add more + delete one
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        auto r = ExecSql(db, "SELECT count(*) FROM twal_log");
+        TEST_ASSERT(r.rows[0][0] == "3", "3 rows at start of round 3");
+        ExecSql(db, "INSERT INTO twal_log VALUES(4, 'round3')");
+        ExecSql(db, "DELETE FROM twal_log WHERE id = 1");
+        sqlite3_close(db);
+    }
+
+    // Round 4: verify final state
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        auto r = ExecSql(db, "SELECT count(*) FROM twal_log");
+        TEST_ASSERT(r.rows[0][0] == "3", "3 rows in round 4");
+        r = ExecSql(db, "SELECT id, msg FROM twal_log ORDER BY id");
+        TEST_ASSERT(r.rows.size() == 3, "3 rows ordered");
+        TEST_ASSERT(r.rows[0][0] == "2", "id 2 first");
+        TEST_ASSERT(r.rows[2][1] == "round3", "round3 entry present");
+        sqlite3_close(db);
+    }
+    unlink(path.c_str());
+}
+
+// =====================================================================
 // Main
 // =====================================================================
 
@@ -610,6 +831,13 @@ int main(int argc, char* argv[]) {
     RUN_TEST(TestTriggers);
     RUN_TEST(TestForeignKeys);
     RUN_TEST(TestReadYourOwnWrites);
+
+    printf("\n[Part 5] Backup and restore (WAL)\n");
+    RUN_TEST(TestWalBasic);
+    RUN_TEST(TestWalMultipleTables);
+    RUN_TEST(TestWalDeletes);
+    RUN_TEST(TestWalTransactionRollback);
+    RUN_TEST(TestWalSurvivesMultipleReopens);
 
     // Cleanup
     if (g_db) {

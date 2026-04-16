@@ -40,6 +40,32 @@ void oroMotShutdown(void);
 int oroMotIsInit(void);
 
 /* ============================================================
+ * Write-Ahead Log (WAL) for MOT persistence
+ *
+ * When enabled, MOT row changes are logged into a native SQLite
+ * table `_mot_wal` in the same database file. SQLite's own
+ * durability guarantees make this crash-safe.
+ *
+ * Usage:
+ *   sqlite3_open("mydb.db", &db);
+ *   oroMotWalEnable(db);    // once per connection after open
+ *   oroMotWalRecover(db);   // replays any existing WAL entries
+ *   // ... use the database normally
+ * ============================================================ */
+
+/* Enable WAL on this connection. Creates the _mot_wal table if needed.
+ * Returns 0 on success. */
+int oroMotWalEnable(void* pDb);
+
+/* Replay any WAL entries back into MOT tables.
+ * Call AFTER schema is loaded (MOT tables exist as empty) and BEFORE
+ * accepting user queries. Returns the number of entries replayed, or -1. */
+int oroMotWalRecover(void* pDb);
+
+/* Returns 1 if WAL is enabled on this connection. */
+int oroMotWalIsEnabled(void* pDb);
+
+/* ============================================================
  * Table registry (called from sqlite3.c during DDL)
  * ============================================================ */
 

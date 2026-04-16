@@ -71,8 +71,9 @@ COMMIT;  -- or ROLLBACK;
 | Explicit transactions (BEGIN/COMMIT/ROLLBACK) | Yes | Yes |
 | Autocommit (implicit per-statement) | Yes | Yes |
 | Data types: INTEGER, REAL, TEXT, BLOB | Yes | Yes |
-| Schema persistence (survives DB reopen) | Yes (schema only) | Yes (with data) |
-| WAL / journal | No | Yes |
+| Schema persistence (survives DB reopen) | Yes | Yes |
+| Data persistence (via WAL, opt-in) | Yes | Yes |
+| WAL / journal | Yes (via _mot_wal) | Yes (native) |
 | CREATE INDEX | Yes | Yes |
 | Triggers | Yes | Yes |
 | Foreign keys | Yes | Yes |
@@ -133,11 +134,27 @@ This storage-as-BLOB approach avoids per-column type translation. SQLite's
 OP_Column decodes the record bytes normally after our adapter hands them
 back via `oroMotPayloadFetch`.
 
+## Persistence
+
+MOT tables are in-memory by default. Enable **WAL persistence** to make
+them survive process restarts:
+
+```c
+sqlite3_open("mydb.db", &db);
+oroMotWalEnable(db);      // creates _mot_wal table
+oroMotWalRecover(db);     // replays any existing WAL entries
+// ... use normally; every INSERT/DELETE logs to _mot_wal
+```
+
+`oro_server` auto-enables WAL for file-backed databases. The `_mot_wal`
+table piggybacks on SQLite's own durability (rollback journal or WAL),
+so a single fsync atomically commits both SQLite-side changes and MOT
+log entries. No custom fsync management.
+
 ## Limitations
 
-1. **In-memory only**: MOT data is lost on process exit. The SQLite schema
-   is preserved (MOT tables come back empty on reopen). Activating MOT's
-   own redo-log infrastructure is a future task.
+1. **MOT data requires WAL for persistence**: without `oroMotWalEnable`,
+   MOT data is in-memory only. The SQLite schema always persists.
 
 2. **Read-your-own-writes during transaction**: Within a `BEGIN..COMMIT`,
    `SELECT` on a MOT table does not yet see the current transaction's

@@ -357,6 +357,12 @@ static void handleClient(int fd, const char* dbPath) {
     // Enable FK enforcement
     sqlite3_exec(db, "PRAGMA foreign_keys = ON", nullptr, nullptr, nullptr);
 
+    // Enable MOT WAL persistence for file-backed databases
+    if (strcmp(dbPath, ":memory:") != 0) {
+        oroMotWalEnable(db);
+        oroMotWalRecover(db);
+    }
+
     // --- Query loop ---
     while (true) {
         // Read message: [1:type][4:length][payload]
