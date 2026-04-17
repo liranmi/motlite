@@ -65,6 +65,12 @@ int oroMotWalRecover(void* pDb);
 /* Returns 1 if WAL is enabled on this connection. */
 int oroMotWalIsEnabled(void* pDb);
 
+/* Checkpoint: replace the accumulated WAL with a fresh snapshot of
+ * current MOT state. After this, replay time is bounded by the number
+ * of live rows, not the historical write count.
+ * Returns the number of rows snapshotted, or -1 on error. */
+int oroMotWalCheckpoint(void* pDb);
+
 /* ============================================================
  * Table registry (called from sqlite3.c during DDL)
  * ============================================================ */

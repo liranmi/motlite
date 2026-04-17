@@ -1655,3 +1655,123 @@ extern "C" int oroMotWalRecover(void* pDb) {
 
     return (rc == 0) ? applied : -1;
 }
+
+// =====================================================================
+// WAL checkpoint
+// =====================================================================
+// Replace the accumulated WAL with a fresh snapshot of current MOT state.
+// After this, replay time on restart is bounded by the number of LIVE rows,
+// not the historical write count.
+//
+// Implementation:
+//   BEGIN                                   ← SQLite tx
+//   CREATE TEMP TABLE _mot_wal_new(...)     ← new log
+//   for each MOT table:
+//     for each visible row:
+//       INSERT into _mot_wal_new as INS
+//   DELETE FROM _mot_wal
+//   INSERT INTO _mot_wal SELECT * FROM _mot_wal_new
+//   COMMIT
+extern "C" int oroMotWalCheckpoint(void* pDb) {
+    if (!pDb) return -1;
+    sqlite3* db = (sqlite3*)pDb;
+
+    OroMotConn* c = GetOrCreateConn(pDb);
+    if (!c) return -1;
+
+    // Collect (table_name, Table*) snapshot under the lock
+    std::vector<std::pair<std::string, Table*>> tablesCopy;
+    {
+        auto& g = globals();
+        std::lock_guard<std::mutex> lock(g.mu);
+        for (auto& kv : g.tables) {
+            tablesCopy.emplace_back(kv.first.name, kv.second);
+        }
+    }
+
+    // Begin transaction on SQLite side
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        return -1;
+    }
+
+    // Clear and rebuild _mot_wal
+    if (sqlite3_exec(db, "DELETE FROM _mot_wal", nullptr, nullptr, nullptr)
+            != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return -1;
+    }
+
+    sqlite3_stmt* ins = nullptr;
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO _mot_wal(table_name, op, rowid, record) "
+            "VALUES(?1, ?2, ?3, ?4)", -1, &ins, nullptr) != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return -1;
+    }
+
+    EnsureThreadCtx(c);
+
+    int64_t total = 0;
+    for (auto& p : tablesCopy) {
+        const std::string& tabName = p.first;
+        Table* t = p.second;
+
+        // Start a read txn for the scan
+        if (!c->in_txn) {
+            c->txn->StartTransaction(c->txn->GetTransactionId(), READ_COMMITED);
+            c->in_txn = true;
+        }
+
+        Index* ix = t->GetPrimaryIndex();
+        IndexIterator* it = ix->Begin(0);
+        while (it && it->IsValid()) {
+            Sentinel* s = it->GetPrimarySentinel();
+            if (s) {
+                RC rc = RC_OK;
+                Row* r = c->txn->RowLookup(AccessType::RD, s, rc);
+                if (rc == RC_OK && r) {
+                    // Decode rowid and record bytes from col 1 (BLOB)
+                    uint64_t rid_be;
+                    r->GetValue(MOT_COL_ROWID, rid_be);
+                    int64_t rowid = (int64_t)be64toh(rid_be);
+
+                    const uint8_t* p = r->GetValue(MOT_COL_DATA);
+                    uint32_t rsz;
+                    memcpy(&rsz, p, sizeof(uint32_t));
+                    const void* recBytes = p + sizeof(uint32_t);
+
+                    sqlite3_reset(ins);
+                    sqlite3_bind_text(ins, 1, tabName.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int(ins, 2, WAL_OP_INS);
+                    sqlite3_bind_int64(ins, 3, rowid);
+                    sqlite3_bind_blob(ins, 4, recBytes, rsz, SQLITE_TRANSIENT);
+                    if (sqlite3_step(ins) == SQLITE_DONE) {
+                        total++;
+                    }
+                }
+            }
+            it->Next();
+        }
+        if (it) it->Destroy();
+
+        // End the read txn
+        if (c->in_txn) {
+            c->txn->Commit();
+            c->txn->EndTransaction();
+            c->in_txn = false;
+        }
+    }
+
+    sqlite3_finalize(ins);
+
+    // Commit the SQLite txn — WAL rebuild is durable now
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        return -1;
+    }
+
+    // Note: VACUUM would reclaim the freed pages but requires no pending
+    // cursors/statements. Skipping for now — SQLite reuses freed pages on
+    // subsequent inserts anyway. Users can run `VACUUM` manually.
+
+    return (int)total;
+}

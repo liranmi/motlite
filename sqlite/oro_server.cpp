@@ -313,36 +313,57 @@ static void handleQuery(int fd, sqlite3* db, const char* sql) {
         return;
     }
 
+    // Special command: CHECKPOINT (compacts the MOT WAL)
+    if (strncasecmp(p, "CHECKPOINT", 10) == 0 &&
+        (p[10] == ';' || p[10] == '\0' || p[10] == ' ' || p[10] == '\t')) {
+        int n = oroMotWalCheckpoint((void*)db);
+        if (n < 0) {
+            sendErrorResponse(fd, "ERROR", "XX000", "checkpoint failed");
+        } else {
+            char tag[64];
+            snprintf(tag, sizeof(tag), "CHECKPOINT %d", n);
+            sendCommandComplete(fd, tag);
+        }
+        sendReadyForQuery(fd, 'I');
+        return;
+    }
+
     // Rewrite PG-specific syntax (~, !~, ::regclass, etc.) to SQLite-compatible
     std::string rewritten = oroPgRewriteQuery(sql);
 
-    // Iterate statements in the string (semicolon-separated)
-    const char* cursor = rewritten.c_str();
-    while (cursor && *cursor) {
-        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' || *cursor == '\r' || *cursor == ';')
-            cursor++;
-        if (!*cursor) break;
-
-        // Skip leading whitespace to find first word for tag
-        const char* firstWord = cursor;
-
-        sqlite3_stmt* stmt = nullptr;
-        const char* tail = nullptr;
-        int rc = sqlite3_prepare_v2(db, cursor, -1, &stmt, &tail);
-        if (rc != SQLITE_OK || !stmt) {
-            sendErrorResponse(fd, "ERROR", "42000", sqlite3_errmsg(db));
-            break;
-        }
-        execOneStmt(fd, db, stmt, firstWord);
-        sqlite3_finalize(stmt);
-        cursor = tail;
+    QueryState qs = {fd, 0, 0, false, false};
+    char* errmsg = nullptr;
+    int rc = sqlite3_exec(db, rewritten.c_str(), queryCallback, &qs, &errmsg);
+    if (rc != SQLITE_OK) {
+        sendErrorResponse(fd, "ERROR", "42000", errmsg ? errmsg : "?");
+        if (errmsg) sqlite3_free(errmsg);
+    } else if (!qs.header_sent) {
+        const char* tag = "OK";
+        char buf[64];
+        if (strncasecmp(p, "INSERT", 6) == 0) {
+            snprintf(buf, sizeof(buf), "INSERT 0 %d", sqlite3_changes(db));
+            tag = buf;
+        } else if (strncasecmp(p, "UPDATE", 6) == 0) {
+            snprintf(buf, sizeof(buf), "UPDATE %d", sqlite3_changes(db));
+            tag = buf;
+        } else if (strncasecmp(p, "DELETE", 6) == 0) {
+            snprintf(buf, sizeof(buf), "DELETE %d", sqlite3_changes(db));
+            tag = buf;
+        } else if (strncasecmp(p, "CREATE", 6) == 0) tag = "CREATE TABLE";
+        else if (strncasecmp(p, "DROP", 4) == 0) tag = "DROP TABLE";
+        else if (strncasecmp(p, "BEGIN", 5) == 0) tag = "BEGIN";
+        else if (strncasecmp(p, "COMMIT", 6) == 0) tag = "COMMIT";
+        else if (strncasecmp(p, "ROLLBACK", 8) == 0) tag = "ROLLBACK";
+        sendCommandComplete(fd, tag);
+    } else {
+        char tag[64]; snprintf(tag, sizeof(tag), "SELECT %d", qs.nrows);
+        sendCommandComplete(fd, tag);
     }
-
     sendReadyForQuery(fd, 'I');
     return;
 }
 
-// Legacy unused (kept for compatibility)
+// Unused legacy path — reserved for fallback debugging
 static void handleQueryLegacy(int fd, sqlite3* db, const char* sql) {
     const char* p = sql;
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
