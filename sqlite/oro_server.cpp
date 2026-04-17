@@ -36,6 +36,7 @@
 
 #include "sqlite3.h"
 #include "oro_mot_adapter.h"
+#include "oro_pg_catalog.h"
 
 // =====================================================================
 // PG wire protocol helpers
@@ -233,9 +234,12 @@ static void handleQuery(int fd, sqlite3* db, const char* sql) {
         return;
     }
 
+    // Rewrite PG-specific syntax (~, !~, ::regclass, etc.) to SQLite-compatible
+    std::string rewritten = oroPgRewriteQuery(sql);
+
     QueryState qs = {fd, 0, 0, false, false};
     char* errmsg = nullptr;
-    int rc = sqlite3_exec(db, sql, queryCallback, &qs, &errmsg);
+    int rc = sqlite3_exec(db, rewritten.c_str(), queryCallback, &qs, &errmsg);
 
     if (rc != SQLITE_OK) {
         const char* msg = errmsg ? errmsg : "unknown error";
@@ -362,6 +366,9 @@ static void handleClient(int fd, const char* dbPath) {
         oroMotWalEnable(db);
         oroMotWalRecover(db);
     }
+
+    // Set up PostgreSQL catalog compatibility (so psql \dt etc. work)
+    oroPgCatalogInit(db);
 
     // --- Query loop ---
     while (true) {

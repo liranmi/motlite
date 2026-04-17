@@ -125,7 +125,10 @@ add_custom_command(TARGET oro_shell POST_BUILD
 # =====================================================================
 # oro_server (PostgreSQL wire protocol server)
 # =====================================================================
-add_executable(oro_server sqlite/oro_server.cpp)
+add_executable(oro_server
+    sqlite/oro_server.cpp
+    sqlite/oro_pg_catalog.cpp
+)
 target_link_libraries(oro_server PRIVATE oro_mot_adapter sqlite3_lib pthread)
 target_include_directories(oro_server PRIVATE
     ${CMAKE_SOURCE_DIR}/sqlite ${SQLITE3_SRC_DIR})
