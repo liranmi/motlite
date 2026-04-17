@@ -1648,8 +1648,10 @@ extern "C" int oroMotWalRecover(void* pDb) {
 
     c->wal_replaying = false;
 
-    // Clear the replayed entries (they're now in MOT)
-    sqlite3_exec(db, "DELETE FROM _mot_wal", nullptr, nullptr, nullptr);
+    // Keep _mot_wal intact. Replays are idempotent (UNIQUE violations and
+    // missing-delete rows are both treated as already-applied), so every
+    // new connection can safely re-replay to restore MOT state if lost.
+    // Checkpointing (truncate after snapshot) is future work.
 
     return (rc == 0) ? applied : -1;
 }

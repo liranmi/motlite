@@ -224,6 +224,85 @@ static int queryCallback(void* data, int ncols, char** values, char** names) {
     return 0;
 }
 
+// Process a single prepared statement: send RowDescription upfront (even for
+// 0-row results), then DataRow per row, then CommandComplete.
+// Returns 0 on success, -1 on send failure.
+static int execOneStmt(int fd, sqlite3* db, sqlite3_stmt* stmt, const char* firstWord) {
+    int ncols = sqlite3_column_count(stmt);
+
+    if (ncols > 0) {
+        // SELECT-like: send RowDescription first
+        std::vector<std::string> nameStore(ncols);
+        std::vector<const char*> names(ncols);
+        for (int i = 0; i < ncols; i++) {
+            const char* n = sqlite3_column_name(stmt, i);
+            nameStore[i] = n ? n : "";
+            names[i] = nameStore[i].c_str();
+        }
+        if (!sendRowDescription(fd, ncols, names.data())) return -1;
+
+        int64_t nrows = 0;
+        while (true) {
+            int rc = sqlite3_step(stmt);
+            if (rc == SQLITE_ROW) {
+                std::vector<std::string> valStore(ncols);
+                std::vector<const char*> vals(ncols);
+                for (int i = 0; i < ncols; i++) {
+                    int type = sqlite3_column_type(stmt, i);
+                    if (type == SQLITE_NULL) {
+                        vals[i] = nullptr;
+                    } else {
+                        const char* v = (const char*)sqlite3_column_text(stmt, i);
+                        valStore[i] = v ? v : "";
+                        vals[i] = valStore[i].c_str();
+                    }
+                }
+                if (!sendDataRow(fd, ncols, vals.data())) return -1;
+                nrows++;
+            } else if (rc == SQLITE_DONE) {
+                break;
+            } else {
+                sendErrorResponse(fd, "ERROR", "42000", sqlite3_errmsg(db));
+                return 0;
+            }
+        }
+        char tag[64];
+        snprintf(tag, sizeof(tag), "SELECT %ld", (long)nrows);
+        sendCommandComplete(fd, tag);
+    } else {
+        // DDL/DML: step once
+        int rc = sqlite3_step(stmt);
+        if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+            sendErrorResponse(fd, "ERROR", "42000", sqlite3_errmsg(db));
+            return 0;
+        }
+        const char* tag = "OK";
+        char buf[64];
+        if (strncasecmp(firstWord, "INSERT", 6) == 0) {
+            snprintf(buf, sizeof(buf), "INSERT 0 %d", sqlite3_changes(db));
+            tag = buf;
+        } else if (strncasecmp(firstWord, "UPDATE", 6) == 0) {
+            snprintf(buf, sizeof(buf), "UPDATE %d", sqlite3_changes(db));
+            tag = buf;
+        } else if (strncasecmp(firstWord, "DELETE", 6) == 0) {
+            snprintf(buf, sizeof(buf), "DELETE %d", sqlite3_changes(db));
+            tag = buf;
+        } else if (strncasecmp(firstWord, "CREATE", 6) == 0) {
+            tag = "CREATE TABLE";
+        } else if (strncasecmp(firstWord, "DROP", 4) == 0) {
+            tag = "DROP TABLE";
+        } else if (strncasecmp(firstWord, "BEGIN", 5) == 0) {
+            tag = "BEGIN";
+        } else if (strncasecmp(firstWord, "COMMIT", 6) == 0) {
+            tag = "COMMIT";
+        } else if (strncasecmp(firstWord, "ROLLBACK", 8) == 0) {
+            tag = "ROLLBACK";
+        }
+        sendCommandComplete(fd, tag);
+    }
+    return 0;
+}
+
 static void handleQuery(int fd, sqlite3* db, const char* sql) {
     // Skip empty queries
     const char* p = sql;
@@ -237,43 +316,52 @@ static void handleQuery(int fd, sqlite3* db, const char* sql) {
     // Rewrite PG-specific syntax (~, !~, ::regclass, etc.) to SQLite-compatible
     std::string rewritten = oroPgRewriteQuery(sql);
 
+    // Iterate statements in the string (semicolon-separated)
+    const char* cursor = rewritten.c_str();
+    while (cursor && *cursor) {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' || *cursor == '\r' || *cursor == ';')
+            cursor++;
+        if (!*cursor) break;
+
+        // Skip leading whitespace to find first word for tag
+        const char* firstWord = cursor;
+
+        sqlite3_stmt* stmt = nullptr;
+        const char* tail = nullptr;
+        int rc = sqlite3_prepare_v2(db, cursor, -1, &stmt, &tail);
+        if (rc != SQLITE_OK || !stmt) {
+            sendErrorResponse(fd, "ERROR", "42000", sqlite3_errmsg(db));
+            break;
+        }
+        execOneStmt(fd, db, stmt, firstWord);
+        sqlite3_finalize(stmt);
+        cursor = tail;
+    }
+
+    sendReadyForQuery(fd, 'I');
+    return;
+}
+
+// Legacy unused (kept for compatibility)
+static void handleQueryLegacy(int fd, sqlite3* db, const char* sql) {
+    const char* p = sql;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p == '\0') { sendEmptyQuery(fd); sendReadyForQuery(fd, 'I'); return; }
+    std::string rewritten = oroPgRewriteQuery(sql);
     QueryState qs = {fd, 0, 0, false, false};
     char* errmsg = nullptr;
     int rc = sqlite3_exec(db, rewritten.c_str(), queryCallback, &qs, &errmsg);
-
     if (rc != SQLITE_OK) {
         const char* msg = errmsg ? errmsg : "unknown error";
         sendErrorResponse(fd, "ERROR", "42000", msg);
         if (errmsg) sqlite3_free(errmsg);
     } else {
-        // If no rows were returned (DDL/DML), send appropriate tag
         if (!qs.header_sent) {
-            // Determine command type for the tag
             const char* tag = "OK";
             if (strncasecmp(p, "INSERT", 6) == 0) {
                 tag = "INSERT 0 1";
-            } else if (strncasecmp(p, "UPDATE", 6) == 0) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "UPDATE %d", sqlite3_changes(db));
-                sendCommandComplete(fd, buf);
-                sendReadyForQuery(fd, 'I');
-                return;
-            } else if (strncasecmp(p, "DELETE", 6) == 0) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "DELETE %d", sqlite3_changes(db));
-                sendCommandComplete(fd, buf);
-                sendReadyForQuery(fd, 'I');
-                return;
             } else if (strncasecmp(p, "CREATE", 6) == 0) {
                 tag = "CREATE TABLE";
-            } else if (strncasecmp(p, "DROP", 4) == 0) {
-                tag = "DROP TABLE";
-            } else if (strncasecmp(p, "BEGIN", 5) == 0) {
-                tag = "BEGIN";
-            } else if (strncasecmp(p, "COMMIT", 6) == 0) {
-                tag = "COMMIT";
-            } else if (strncasecmp(p, "ROLLBACK", 8) == 0) {
-                tag = "ROLLBACK";
             }
             sendCommandComplete(fd, tag);
         } else {
