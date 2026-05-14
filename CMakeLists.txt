@@ -8,6 +8,16 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
+# Sanitizer profiles. Opt in with -DMOTLITE_SANITIZE=address|thread|undefined.
+# ASan and TSan are mutually exclusive; UBSan can layer on either.
+set(MOTLITE_SANITIZE "" CACHE STRING
+    "Enable a sanitizer (address|thread|undefined). Empty disables.")
+if(MOTLITE_SANITIZE)
+    message(STATUS "  Sanitizer: ${MOTLITE_SANITIZE}")
+    add_compile_options(-fsanitize=${MOTLITE_SANITIZE} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${MOTLITE_SANITIZE})
+endif()
+
 # =====================================================================
 # Fetch oro-db (the MOT in-memory engine)
 # =====================================================================
@@ -125,11 +135,17 @@ add_custom_command(TARGET oro_shell POST_BUILD
 # =====================================================================
 # oro_server (PostgreSQL wire protocol server)
 # =====================================================================
+find_package(OpenSSL QUIET)
 add_executable(oro_server
     sqlite/oro_server.cpp
     sqlite/oro_pg_catalog.cpp
+    sqlite/oro_auth.cpp
 )
 target_link_libraries(oro_server PRIVATE oro_mot_adapter sqlite3_lib pthread)
+if(OpenSSL_FOUND)
+    target_link_libraries(oro_server PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(oro_server PRIVATE ORO_HAVE_OPENSSL=1)
+endif()
 target_include_directories(oro_server PRIVATE
     ${CMAKE_SOURCE_DIR}/sqlite ${SQLITE3_SRC_DIR})
 target_compile_options(oro_server PRIVATE -Wno-unused-parameter -fpermissive)
@@ -150,6 +166,23 @@ add_custom_command(TARGET motlite_test POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_SOURCE_DIR}/config/mot.conf $<TARGET_FILE_DIR:motlite_test>/mot.conf
 )
+
+# =====================================================================
+# libpq-based load/conformance harness (optional; needs libpq-dev)
+# =====================================================================
+find_path(LIBPQ_INCLUDE_DIR libpq-fe.h
+    PATH_SUFFIXES postgresql
+    PATHS /usr/include /usr/local/include)
+find_library(LIBPQ_LIB pq)
+if(LIBPQ_INCLUDE_DIR AND LIBPQ_LIB)
+    message(STATUS "  libpq:        ${LIBPQ_LIB}")
+    add_executable(harness_libpq_load test/harness/libpq_load.cpp)
+    target_include_directories(harness_libpq_load PRIVATE ${LIBPQ_INCLUDE_DIR})
+    target_link_libraries(harness_libpq_load PRIVATE ${LIBPQ_LIB} pthread)
+    target_compile_options(harness_libpq_load PRIVATE -Wno-unused-parameter)
+else()
+    message(STATUS "  libpq:        NOT FOUND (skipping harness_libpq_load)")
+endif()
 
 # =====================================================================
 # Summary

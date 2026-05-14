@@ -36,6 +36,7 @@
 #include "txn_access.h"
 
 #include <vector>
+#include <map>
 #include <algorithm>
 
 using namespace MOT;
@@ -87,6 +88,18 @@ struct OroMotConn {
     void*          pDb           = nullptr;  // sqlite3* for executing WAL SQL
     void*          ins_stmt      = nullptr;  // prepared INSERT for WAL
     void*          del_stmt      = nullptr;  // prepared DELETE marker for WAL
+    // Auto-checkpoint state. Threshold 0 disables; counter is reset after each
+    // successful checkpoint. Auto-checkpoint only fires outside an explicit
+    // SQLite transaction (sqlite3_get_autocommit == 1) and outside replay.
+    uint64_t       wal_writes_since_ck = 0;
+    uint64_t       wal_ck_threshold    = 0;
+    // RYOW pending-inserts overlay. MOT's RowLookup via sentinel misses the
+    // current txn's own inserts (the access-set AccessLookup doesn't match),
+    // so we keep our own map: per-table, rowid → staged Row*. Read paths
+    // (CursorAdvance after iter exhaust, oroMotSeekRowid on miss, oroMotCount)
+    // merge in these entries to give read-your-own-writes semantics. Cleared
+    // on commit/rollback. Pointers remain valid throughout the MOT txn.
+    std::unordered_map<MOT::Table*, std::map<int64_t, MOT::Row*>> pending_inserts;
 };
 
 // Table registry: (iDb, table_name) → MOT::Table*
@@ -173,9 +186,12 @@ struct OroMotCursor {
     // --- Index cursor fields ---
     bool             is_index    = false;
     int64_t          idx_rowid   = 0;       // rowid from current index entry
-    // --- RYOW: pending inserts (sorted by rowid) ---
-    std::vector<PendingRow> pending;
-    size_t           pending_pos = 0;
+    // --- RYOW: when true, the regular MOT iter is exhausted and we're
+    // draining the connection's pending-inserts overlay for this table.
+    // pending_last is the rowid of the most recently emitted pending row;
+    // PendingNextAfter(conn, table, pending_last, ...) gives the next one.
+    bool             pending_mode = false;
+    int64_t          pending_last = INT64_MIN;
 };
 
 // =====================================================================
@@ -275,6 +291,7 @@ extern "C" int oroMotConnDetach(void* pDb) {
         c->txn->EndTransaction();
         c->in_txn = false;
     }
+    c->pending_inserts.clear();
     g_engine->GetSessionManager()->DestroySessionContext(c->session);
     delete c;
     g.conns.erase(it);
@@ -306,6 +323,7 @@ extern "C" int oroMotCommit(void* pDb) {
         RC rc = c->txn->Commit();
         c->txn->EndTransaction();
         c->in_txn = false;
+        c->pending_inserts.clear();
         return (rc == RC_OK) ? 0 : 1;
     }
     return 0;
@@ -326,8 +344,12 @@ extern "C" int oroMotRollback(void* pDb) {
         c->txn->EndTransaction();
         c->in_txn = false;
     }
+    c->pending_inserts.clear();
     return 0;
 }
+
+// Forward decl — defined alongside WAL helpers later in the file.
+static void MaybeAutoCheckpoint(OroMotConn* c);
 
 extern "C" int oroMotAutoCommit(void* pDb) {
     // Same as oroMotCommit but safely no-ops if no connection or no active txn.
@@ -339,12 +361,19 @@ extern "C" int oroMotAutoCommit(void* pDb) {
         if (it == g.conns.end()) return 0;
         c = it->second;
     }
-    if (!c->in_txn) return 0;
-    EnsureThreadCtx(c);
-    RC rc = c->txn->Commit();
-    c->txn->EndTransaction();
-    c->in_txn = false;
-    return (rc == RC_OK) ? 0 : 1;
+    int result = 0;
+    if (c->in_txn) {
+        EnsureThreadCtx(c);
+        RC rc = c->txn->Commit();
+        c->txn->EndTransaction();
+        c->in_txn = false;
+        c->pending_inserts.clear();
+        result = (rc == RC_OK) ? 0 : 1;
+    }
+    // Statement boundary in autocommit mode — safe place to run an auto
+    // checkpoint if the threshold has been crossed.
+    MaybeAutoCheckpoint(c);
+    return result;
 }
 
 extern "C" int oroMotHasActiveTxn(void* pDb) {
@@ -526,31 +555,98 @@ extern "C" void oroMotCursorClose(OroMotCursor* pCur) {
     delete pCur;
 }
 
+// =====================================================================
+// RYOW pending-inserts overlay
+// =====================================================================
+//
+// MOT's RowLookup(AccessType::RD, sentinel) misses rows the current txn
+// just inserted: the sentinel for the new row is in the MassTree, but
+// AccessLookup against the txn's access set fails (sentinel-identity
+// mismatch). The fix lives entirely in this adapter — we keep a per-conn
+// map of pending rowids and the staged Row* for each one, and the read
+// paths merge it in. Cleared on commit/rollback (oroMotCommit /
+// oroMotRollback / oroMotAutoCommit).
+
+static void PendingInsert(OroMotConn* c, Table* t, int64_t rowid, Row* r) {
+    if (!c) return;
+    c->pending_inserts[t][rowid] = r;
+}
+
+static void PendingClear(OroMotConn* c) {
+    if (!c) return;
+    c->pending_inserts.clear();
+}
+
+// Public-from-this-TU helpers used by oroMotCount and the cursor advance
+// path. Returned Row* is owned by MOT's txn access set; valid until commit.
+extern "C" int64_t oroMotPendingCount(OroMotConn* c, Table* t) {
+    if (!c) return 0;
+    auto it = c->pending_inserts.find(t);
+    if (it == c->pending_inserts.end()) return 0;
+    return (int64_t)it->second.size();
+}
+
+static Row* PendingFind(OroMotConn* c, Table* t, int64_t rowid) {
+    if (!c) return nullptr;
+    auto it = c->pending_inserts.find(t);
+    if (it == c->pending_inserts.end()) return nullptr;
+    auto jt = it->second.find(rowid);
+    return (jt == it->second.end()) ? nullptr : jt->second;
+}
+
+// Yield the next pending row strictly greater than `after_rowid` (or the
+// first one if after_rowid == INT64_MIN). Returns nullptr when exhausted.
+static Row* PendingNextAfter(OroMotConn* c, Table* t, int64_t after_rowid,
+                             int64_t* out_rowid) {
+    if (!c) return nullptr;
+    auto it = c->pending_inserts.find(t);
+    if (it == c->pending_inserts.end()) return nullptr;
+    auto& m = it->second;
+    auto next = (after_rowid == INT64_MIN) ? m.begin() : m.upper_bound(after_rowid);
+    if (next == m.end()) return nullptr;
+    *out_rowid = next->first;
+    return next->second;
+}
+
 // Advance iter to next MVCC-visible row, or EOF.
-// MOT's ExecuteOptimisticInsert puts newly inserted rows into the MassTree
-// index AND the txn's access set. RowLookup finds them via AccessLookup.
-// So no special pending-insert merge is needed — RYOW works automatically.
+// Note: plain RD on the sentinel misses the current txn's own pending
+// inserts. After the regular iter exhausts, CursorAdvance falls through
+// to the pending overlay (PendingNextAfter) for read-your-own-writes.
 static void CursorAdvance(OroMotCursor* cur) {
     EnsureThreadCtx(cur->conn);
-    while (cur->iter && cur->iter->IsValid()) {
-        Sentinel* s = cur->iter->GetPrimarySentinel();
-        if (s) {
-            RC rc = RC_OK;
-            Row* r = cur->conn->txn->RowLookup(AccessType::RD, s, rc);
-            if (rc != RC_OK) {
-                cur->at_eof = true;
-                return;
+    if (!cur->pending_mode) {
+        while (cur->iter && cur->iter->IsValid()) {
+            Sentinel* s = cur->iter->GetPrimarySentinel();
+            if (s) {
+                RC rc = RC_OK;
+                Row* r = cur->conn->txn->RowLookup(AccessType::RD, s, rc);
+                if (rc != RC_OK) {
+                    cur->at_eof = true;
+                    return;
+                }
+                if (r) {
+                    cur->current_row = r;
+                    uint64_t rid_be;
+                    r->GetValue(MOT_COL_ROWID, rid_be);
+                    cur->current_rowid = (int64_t)be64toh(rid_be);
+                    cur->at_eof = false;
+                    return;
+                }
             }
-            if (r) {
-                cur->current_row = r;
-                uint64_t rid_be;
-                r->GetValue(MOT_COL_ROWID, rid_be);
-                cur->current_rowid = (int64_t)be64toh(rid_be);
-                cur->at_eof = false;
-                return;
-            }
+            cur->iter->Next();
         }
-        cur->iter->Next();
+        // Regular iter exhausted — switch into pending-overlay mode.
+        cur->pending_mode = true;
+        cur->pending_last = INT64_MIN;
+    }
+    int64_t next_rid = 0;
+    Row* r = PendingNextAfter(cur->conn, cur->table, cur->pending_last, &next_rid);
+    if (r) {
+        cur->current_row = r;
+        cur->current_rowid = next_rid;
+        cur->pending_last = next_rid;
+        cur->at_eof = false;
+        return;
     }
     cur->at_eof = true;
 }
@@ -565,6 +661,8 @@ extern "C" int oroMotFirst(OroMotCursor* pCur, int* pEof) {
         pCur->iter = nullptr;
     }
     pCur->iter = pCur->index->Begin(0);
+    pCur->pending_mode = false;
+    pCur->pending_last = INT64_MIN;
     if (pCur->is_index) {
         IdxCursorAdvance(pCur);
     } else {
@@ -581,6 +679,12 @@ extern "C" int oroMotLast(OroMotCursor* pCur, int* pEof) {
 }
 
 extern "C" int oroMotNext(OroMotCursor* pCur, int* pEof) {
+    if (pCur->pending_mode) {
+        // Already draining pending overlay — don't touch the regular iter.
+        CursorAdvance(pCur);
+        *pEof = pCur->at_eof ? 1 : 0;
+        return 0;
+    }
     if (pCur->iter) {
         pCur->iter->Next();
         if (pCur->is_index) {
@@ -624,11 +728,20 @@ extern "C" int oroMotSeekRowid(OroMotCursor* pCur, int64_t rowid, int* pRes) {
         pCur->current_rowid = rowid;
         pCur->at_eof = false;
         *pRes = 0;
-    } else {
-        pCur->current_row = nullptr;
-        pCur->at_eof = true;
-        *pRes = -1;
+        return 0;
     }
+    // Miss — check the pending overlay (current txn's own inserts).
+    Row* pr = PendingFind(pCur->conn, pCur->table, rowid);
+    if (pr) {
+        pCur->current_row = pr;
+        pCur->current_rowid = rowid;
+        pCur->at_eof = false;
+        *pRes = 0;
+        return 0;
+    }
+    pCur->current_row = nullptr;
+    pCur->at_eof = true;
+    *pRes = -1;
     return 0;
 }
 
@@ -751,6 +864,12 @@ extern "C" int oroMotInsert(OroMotCursor* pCur, int64_t rowid,
     if (rc != RC_OK) {
         return (rc == RC_UNIQUE_VIOLATION) ? 2 : 1;
     }
+    // Record in the per-conn pending overlay so reads inside this txn see it.
+    // Skip during WAL replay — replay applies a stream of committed writes
+    // and we don't need (or want) to keep an in-memory pending map.
+    if (!pCur->conn->wal_replaying) {
+        PendingInsert(pCur->conn, pCur->table, rowid, row);
+    }
     return 0;
 }
 
@@ -776,6 +895,12 @@ extern "C" int oroMotDelete(OroMotCursor* pCur) {
     rc = pCur->conn->txn->DeleteLastRow();
     if (rc != RC_OK) return 1;
 
+    // If this rowid was staged in our pending overlay (RYOW), drop it so
+    // post-delete reads inside the same txn don't keep seeing it.
+    auto& pi = pCur->conn->pending_inserts;
+    auto it_p = pi.find(pCur->table);
+    if (it_p != pi.end()) it_p->second.erase(rowid_to_delete);
+
     if (pCur->conn->wal_enabled && !pCur->conn->wal_replaying) {
         WalLogDelete(pCur->conn, pCur->table_name.c_str(), rowid_to_delete);
     }
@@ -796,6 +921,9 @@ extern "C" int oroMotCount(OroMotCursor* pCur, int64_t* pCount) {
         it->Next();
     }
     if (it) it->Destroy();
+    // Pending inserts (this txn's own writes) — see RYOW machinery below.
+    extern int64_t oroMotPendingCount(OroMotConn* c, Table* t);
+    n += oroMotPendingCount(pCur->conn, pCur->table);
     *pCount = n;
     return 0;
 }
@@ -1509,6 +1637,12 @@ static const char* WAL_DDL =
 static const char* WAL_INS_SQL =
     "INSERT INTO _mot_wal(table_name, op, rowid, record) VALUES(?1, ?2, ?3, ?4)";
 
+// Per-statement WAL-write counter: incremented from WalLogInsert/Delete; the
+// auto-checkpoint trigger lives in oroMotAutoCommit, which fires after each
+// statement when autocommit is on. We can't checkpoint inside WalLog* because
+// we're nested inside the outer statement's implicit transaction at that
+// point — oroMotWalCheckpoint's own BEGIN IMMEDIATE would conflict.
+
 static int WalLogInsert(OroMotConn* c, const char* tab, int64_t rowid,
                         const void* pData, int nData) {
     if (!c || !c->wal_enabled || !c->ins_stmt) return 1;
@@ -1519,7 +1653,11 @@ static int WalLogInsert(OroMotConn* c, const char* tab, int64_t rowid,
     sqlite3_bind_int64(stmt, 3, rowid);
     sqlite3_bind_blob(stmt, 4, pData, nData, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
-    return (rc == SQLITE_DONE) ? 0 : 1;
+    if (rc == SQLITE_DONE) {
+        c->wal_writes_since_ck++;
+        return 0;
+    }
+    return 1;
 }
 
 static int WalLogDelete(OroMotConn* c, const char* tab, int64_t rowid) {
@@ -1531,7 +1669,24 @@ static int WalLogDelete(OroMotConn* c, const char* tab, int64_t rowid) {
     sqlite3_bind_int64(stmt, 3, rowid);
     sqlite3_bind_null(stmt, 4);
     int rc = sqlite3_step(stmt);
-    return (rc == SQLITE_DONE) ? 0 : 1;
+    if (rc == SQLITE_DONE) {
+        c->wal_writes_since_ck++;
+        return 0;
+    }
+    return 1;
+}
+
+// Called from oroMotAutoCommit (after a statement-level implicit txn has
+// settled). If a threshold is configured and we've crossed it, run a
+// checkpoint and reset the counter. Safe to call when autocommit is on;
+// caller is responsible for not calling it inside an explicit user txn.
+static void MaybeAutoCheckpoint(OroMotConn* c) {
+    if (!c || !c->wal_enabled || c->wal_replaying) return;
+    if (c->wal_ck_threshold == 0) return;
+    if (c->wal_writes_since_ck < c->wal_ck_threshold) return;
+    if (!c->pDb) return;
+    extern int oroMotWalCheckpoint(void*);
+    oroMotWalCheckpoint(c->pDb);  // resets counter on success
 }
 
 extern "C" int oroMotWalEnable(void* pDb) {
@@ -1672,6 +1827,14 @@ extern "C" int oroMotWalRecover(void* pDb) {
 //   DELETE FROM _mot_wal
 //   INSERT INTO _mot_wal SELECT * FROM _mot_wal_new
 //   COMMIT
+extern "C" int oroMotWalSetAutoCheckpoint(void* pDb, uint64_t threshold) {
+    if (!pDb) return 1;
+    OroMotConn* c = GetOrCreateConn(pDb);
+    if (!c) return 1;
+    c->wal_ck_threshold = threshold;
+    return 0;
+}
+
 extern "C" int oroMotWalCheckpoint(void* pDb) {
     if (!pDb) return -1;
     sqlite3* db = (sqlite3*)pDb;
@@ -1773,5 +1936,6 @@ extern "C" int oroMotWalCheckpoint(void* pDb) {
     // cursors/statements. Skipping for now — SQLite reuses freed pages on
     // subsequent inserts anyway. Users can run `VACUUM` manually.
 
+    c->wal_writes_since_ck = 0;
     return (int)total;
 }
