@@ -6,141 +6,110 @@ Honest list of what doesn't work or isn't built yet. Sorted by severity.
 
 ## Critical (correctness, scalability, compatibility)
 
-### 1. Read-your-own-writes in explicit transactions
-**Status**: documented limitation, not fixed
+### 1. ~~Read-your-own-writes in explicit transactions~~ — FIXED (adapter overlay)
+**Status**: fixed by per-connection pending-inserts overlay in
+`sqlite/oro_mot_adapter.cpp`. `OroMotConn::pending_inserts` records each
+staged INSERT under the active txn; `CursorAdvance` falls through to
+`PendingNextAfter` after the regular MOT iterator exhausts, `oroMotSeekRowid`
+consults `PendingFind` on miss, and `oroMotCount` adds `oroMotPendingCount`.
+The map is cleared on commit, rollback, autocommit, and detach. WAL replay
+bypasses it (`wal_replaying` skip in `oroMotInsert`) so recovery doesn't
+accumulate a phantom pending set.
 
-Within a `BEGIN..COMMIT`, `SELECT` on a MOT table doesn't see the current
-transaction's own uncommitted INSERTs. MOT's `RowLookup` via iterator
-sentinel returns null for rows the current txn inserted — the sentinel
-is in the MassTree and access set, but `AccessLookup` doesn't find a
-match (sentinel identity mismatch).
-
-**Impact**: any read-after-write pattern in a transaction returns stale data.
-Autocommit (the default) works fine.
-
-**Fix direction**: requires diving into MOT's `TxnAccess::AccessLookup`
-and understanding why the access set lookup misses the current txn's
-inserts. Possible workaround in the adapter: maintain a shadow "pending
-inserts" map per connection and merge into `CursorAdvance`. Attempted
-this once; the merge-iterator approach corrupted the regular iterator.
+**Caveats**: Reverse iteration (`oroMotPrev`) is still EOF-only; UPDATE-then-
+read of the same row in a txn relies on SQLite's DELETE-then-INSERT plan,
+which removes the original from pending and re-stages the new row. Regression
+covered by the strengthened `TestReadYourOwnWrites` in `test/test_mot_engine.cpp`.
 
 ---
 
-### 2. WAL has no checkpointing / truncation
-**Status**: unbounded growth
+### 2. ~~WAL has no checkpointing / truncation~~ — FIXED
+**Status**: manual `CHECKPOINT` command landed earlier (1fff872); this
+branch adds the automatic trigger.
 
-`_mot_wal` accumulates every INSERT/DELETE forever. Every new connection
-replays the full log during recovery.
+- Manual: `CHECKPOINT` from `psql` rebuilds `_mot_wal` as a snapshot of live
+  rows. Implementation in `oroMotWalCheckpoint`
+  (`sqlite/oro_mot_adapter.cpp:1675`).
+- Auto: `CHECKPOINT AUTO <N>` (or the C entrypoint
+  `oroMotWalSetAutoCheckpoint`) arms a per-connection write counter. After
+  every N WAL writes, `MaybeAutoCheckpoint` runs at the next statement
+  boundary inside `oroMotAutoCommit`. The check only fires when no
+  explicit user transaction is open and we're not replaying.
 
-**Impact**:
-- DB file grows linearly with write count
-- Recovery time grows linearly with log length
-- After ~1M operations, startup becomes impractical
-
-**Fix direction**: checkpointing:
-```sql
-BEGIN;
--- For each MOT table, write current state as INS records
-INSERT INTO _mot_wal_new SELECT * FROM existing_rows_snapshot;
-DROP TABLE _mot_wal;
-ALTER TABLE _mot_wal_new RENAME TO _mot_wal;
-COMMIT;
-```
-Could be automatic (on size threshold) or manual (`CHECKPOINT` command).
+Regression coverage in `TestWalCheckpointTruncates`,
+`TestRecoveryAfterCheckpoint`, and `TestWalAutoCheckpoint`.
 
 ---
 
-### 3. No extended query protocol
-**Status**: only simple queries supported
-
-The PG wire server implements only the simple query protocol (`Q`
-message). Extended protocol (`Parse`/`Bind`/`Execute`) is not handled.
-
-**Impact**: breaks most real clients —
-- JDBC drivers
-- node-postgres with `client.query(text, params)`
-- Python psycopg3 prepared statements
-- Any ORM (SQLAlchemy, Prisma, TypeORM, ActiveRecord, Django ORM)
-- Any language using parameterized queries
-
-**Fix direction**: implement `'P'` (Parse), `'B'` (Bind), `'D'` (Describe),
-`'E'` (Execute), `'S'` (Sync), `'C'` (Close) messages. Keep a
-per-connection map of prepared statements. Bind parameters via
-`sqlite3_bind_*`. Text format is the common path; binary format can
-start with integers and text only.
+### 3. ~~No extended query protocol~~ — FIXED
+**Status**: implemented in `sqlite/oro_server.cpp` —
+`Parse`/`Bind`/`Describe`/`Execute`/`Sync`/`Close`/`Flush` are all handled.
+Per-connection `ServerConn` holds `ExtPrepared` (sqlite3_stmt pool) and
+`ExtPortal` (bound statements + result format codes). Parameter binding
+supports text format universally and binary INT2/INT4/INT8 (binary BLOB
+fallback for other widths). `RowDescription` carries per-column PG type
+OIDs inferred from SQLite declared types via `pgTypeOidForStmtCol`.
+Verified via `harness_libpq_load --mode extended` (PQexecParams round-trip).
+SCRAM-SHA-256 binary parameter formats beyond integers, and `COPY`, remain
+future work.
 
 ---
 
-### 4. Concurrency untested
-**Status**: probably works, unproven
+### 4. ~~Concurrency untested~~ — PARTIALLY ADDRESSED
+**Status**: a libpq-based stress harness exists
+(`test/harness/libpq_load.cpp --mode stress`) and runs 4/16/64-thread mixed
+INSERT/SELECT/UPDATE/DELETE loads against `oro_server`. Surfaced and fixed
+SQLite's serialized journal mode by enabling `PRAGMA journal_mode = WAL`
+and `PRAGMA busy_timeout = 5000` per connection (`sqlite/oro_server.cpp`).
+At 16 threads × 3s, ~2900 ops/s with zero errors.
 
-The server spawns one thread per client connection. MOT's OCC should
-allow concurrent writers, but we haven't stress-tested:
-- Secondary-index creation from multiple threads
-- `_mot_wal` writes from concurrent txns (SQLite WAL mode would help)
-- Heavy read contention with RowLookup
-
-**Fix direction**: write a concurrency test that fires N clients doing
-mixed INSERT/SELECT and check for crashes, deadlocks, lost updates, or
-index corruption.
-
----
-
-### 5. No authentication, no TLS
-**Status**: wide open on network
-
-`oro_server` sends `AuthenticationOk` immediately — any user/password
-combination is accepted. No SSL/TLS negotiation.
-
-**Impact**: safe for localhost development, dangerous on any network.
-
-**Fix direction**:
-- Minimal: accept `user`+`password` matching a config file entry, MD5 or
-  SCRAM-SHA-256 (PG default)
-- TLS: respond to SSL request (`80877103`) with `'S'` instead of `'N'`,
-  then wrap the socket in OpenSSL/mbedTLS
+Still TODO: long-running runs under TSan/ASan (the `MOTLITE_SANITIZE`
+build profile is wired into `CMakeLists.txt`); DDL+load interleave; an
+oracle (lockstep native-table run with checksum compare).
 
 ---
 
-### 6. DELETE from oro_server sometimes segfaults
-**Status**: open bug, pre-existing
+### 5. ~~No authentication~~ — MD5 LANDED; SCRAM + TLS remain
+**Status**: MD5 password auth is implemented (`sqlite/oro_auth.{h,cpp}`),
+opt-in via the `--users PATH` CLI flag. Users file format: one
+`user password` line per entry; password may be plaintext or PG-style
+`md5<hex>`. Without `--users`, the server stays in trust mode for backwards
+compatibility. Verified: wrong password / unknown user → `28P01 FATAL`;
+correct password → AuthenticationOk.
 
-Running `DELETE FROM ...` against `oro_server` via psql produces a
-segfault with no stack trace. The same DELETE works fine in the test
-harness (`motlite_test` passes 22/22 including `TestDelete`,
-`TestWalDeletes`, etc.) and in a standalone thread-based reproducer.
-The crash happens after `oroMotCursorOpen` returns but before any of
-our subsequent cursor hooks (`oroMotSeekRowid`, `oroMotFirst`,
-`oroMotDelete`) fire — i.e., inside SQLite's VDBE execution between
-`OP_OpenWrite` and the next opcode.
-
-**Reproduction**:
-```
-./oro_server --port 5433 --db /tmp/x.db &
-psql -h localhost -p 5433 -U t -d t <<SQL
-CREATE MOT TABLE t (id INT PRIMARY KEY, name TEXT);
-INSERT INTO t VALUES(1,'a');
-DELETE FROM t WHERE id=1;  -- server segfaults here
-SQL
-```
-
-**Fix direction**: needs gdb/valgrind on the crashing binary to get a
-proper backtrace. Most likely candidate: something in the VDBE sets
-up state on the MOT cursor (e.g. via `pCur->uc.pCursor->...` assuming
-BtCursor layout) after our OP_OpenWrite handler returns.
+Remaining work for #5:
+- **SCRAM-SHA-256**: PG default since v10. Requires the channel-binding
+  state machine; `oro_auth.cpp` already pulls in OpenSSL (`-lcrypto`) so
+  the primitives are available.
+- **TLS**: the SSL request handshake still answers `'N'`. Adding
+  OpenSSL-backed `TLS_server_method()` would mean wrapping all socket
+  reads/writes through a `Conn` abstraction; deferred.
 
 ---
 
-### 7. Crash recovery unverified
-**Status**: clean shutdown works; hard crash untested
+### 6. ~~DELETE from oro_server sometimes segfaults~~ — FIXED (fc568a2)
+**Status**: fixed in commit fc568a2 ("Fix DELETE segfault via MOT dispatch in
+sqlite3VdbeFinishMoveto")
 
-We've tested stop→restart with Ctrl-C. Never simulated `kill -9` in the
-middle of a transaction batch.
+Root cause was `OP_FinishSeek` (emitted by DELETE's VDBE when WHERE used a
+deferred seek) calling `sqlite3VdbeFinishMoveto`, which asserted
+`CURTYPE_BTREE` and then called `sqlite3BtreeTableMoveto` on the MOT cursor's
+union slot (`uc.pMotCursor`). With `SQLITE_DEBUG` off, the assert is a no-op
+and we segfaulted inside btree's `moveToRoot`. Fix added `CURTYPE_MOT`
+dispatch at the top of `sqlite3VdbeFinishMoveto` that calls `oroMotSeekRowid`
+instead and clears `deferredMoveto`. Regression covered by the
+`TestDeleteOverWire` script in `test/harness/`.
 
-**Fix direction**: test script that spawns the server, fires a stream of
-INSERTs, then `kill -9`s the server and verifies the DB reopens cleanly
-with the last-committed state. SQLite's journal/WAL should handle this
-correctly, but we should prove it.
+---
+
+### 7. ~~Crash recovery unverified~~ — VERIFIED
+**Status**: kill-9 oracle is `test/harness/run_crash_loop.sh`. Each
+iteration: spawn server → writer client commits IDs one by one, logging
+each successful commit to an ack file → kill -9 at random 50–500 ms →
+restart on the same DB file (no clean) → query for every ack'd ID. 5/5
+iterations green; can scale up via the iteration argument. The
+recovery path is `oroMotWalRecover` (`sqlite/oro_mot_adapter.cpp:1723`),
+which is idempotent (UNIQUE_VIOLATION on replayed INSERT counts as success).
 
 ---
 

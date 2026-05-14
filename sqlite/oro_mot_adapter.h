@@ -71,6 +71,12 @@ int oroMotWalIsEnabled(void* pDb);
  * Returns the number of rows snapshotted, or -1 on error. */
 int oroMotWalCheckpoint(void* pDb);
 
+/* Configure automatic checkpointing. When `threshold` is non-zero, the WAL
+ * write path will call oroMotWalCheckpoint after every `threshold` writes
+ * on this connection — but only when no explicit user transaction is open.
+ * Pass 0 to disable. Default is disabled. Returns 0 on success. */
+int oroMotWalSetAutoCheckpoint(void* pDb, uint64_t threshold);
+
 /* ============================================================
  * Table registry (called from sqlite3.c during DDL)
  * ============================================================ */
