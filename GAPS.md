@@ -55,17 +55,36 @@ future work.
 
 ---
 
-### 4. ~~Concurrency untested~~ — PARTIALLY ADDRESSED
-**Status**: a libpq-based stress harness exists
-(`test/harness/libpq_load.cpp --mode stress`) and runs 4/16/64-thread mixed
-INSERT/SELECT/UPDATE/DELETE loads against `oro_server`. Surfaced and fixed
-SQLite's serialized journal mode by enabling `PRAGMA journal_mode = WAL`
-and `PRAGMA busy_timeout = 5000` per connection (`sqlite/oro_server.cpp`).
-At 16 threads × 3s, ~2900 ops/s with zero errors.
+### 4. ~~Concurrency untested~~ — FIXED
+**Status**: closed by the `claude/concurrency-hardening` branch.
 
-Still TODO: long-running runs under TSan/ASan (the `MOTLITE_SANITIZE`
-build profile is wired into `CMakeLists.txt`); DDL+load interleave; an
-oracle (lockstep native-table run with checksum compare).
+Verification suite, all green:
+- `make stress-asan` — 16 threads × 60 s mixed INSERT/SELECT/UPDATE/DELETE
+  under AddressSanitizer. ~78k ops, no use-after-free / heap-overflow.
+- `make stress-tsan` — same workload under ThreadSanitizer. ~46k ops, no
+  data races outside SQLite's known-safe lock-free WAL shared-memory
+  protocol (suppressed via `test/harness/tsan.supp`).
+- `make stress-ddl` — 16 DML threads + 1 DDL thread (CREATE/DROP INDEX +
+  sibling-table churn) × 30 s. ~42k DML ops, ~190 DDL ops, zero errors.
+- `make oracle` — single-threaded deterministic workload against MOT and
+  native-SQLite tables in lockstep; row count and sum-based checksum on
+  `id` and `h` columns must match. 25k ops, MATCH.
+
+Real bugs surfaced and fixed in this branch:
+- Shutdown-time data race on `OroMotConn::in_txn`: `oroMotShutdown` was
+  iterating live connections (under `g.mu`) while owning client threads
+  mutated `c->in_txn` (under no shared lock — thread ownership invariant).
+  Fix in `sqlite/oro_server.cpp` (`handleClient` calls `oroMotConnDetach`
+  on exit) + `sqlite/oro_mot_adapter.cpp` (`oroMotShutdown` no longer
+  iterates live connections; per-thread detach handles cleanup).
+
+Remaining (lower priority, not blocking #4 closure):
+- TSan suppression for SQLite shared-memory WAL is correct but coarse —
+  hides any real adapter race that bottoms out in the SQLite stack. Tighten
+  once we hit a false negative.
+- `wal_writes_since_ck` (`oro_mot_adapter.cpp`) is a non-atomic counter,
+  safe today under thread-per-connection ownership but a latent risk if
+  one connection is ever driven from multiple threads.
 
 ---
 

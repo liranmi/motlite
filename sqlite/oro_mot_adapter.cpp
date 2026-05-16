@@ -223,20 +223,26 @@ extern "C" int oroMotInit(const char* config_path) {
 
 extern "C" void oroMotShutdown(void) {
     if (!g_initialized.load()) return;
-    // Clean up all connections first
+    // Connections are torn down by their owning thread via oroMotConnDetach
+    // (called from handleClient's exit path). Iterating g.conns here would
+    // race with any client thread still mid-statement on shutdown — under
+    // TSan this surfaces as a data race on OroMotConn::in_txn because the
+    // owning thread mutates it under the per-conn ownership invariant
+    // (no g.mu), while the shutdown loop reads it under g.mu. The two locks
+    // never coincide. We instead require callers to drain live connections
+    // before invoking shutdown.
+    //
+    // If g.conns is non-empty here, it means at least one client thread is
+    // still alive — log it and skip the per-conn loop. The OS will reap
+    // memory on process exit.
     {
         auto& g = globals();
         std::lock_guard<std::mutex> lock(g.mu);
-        for (auto& kv : g.conns) {
-            EnsureThreadCtx(kv.second);
-            if (kv.second->in_txn) {
-                kv.second->txn->Rollback();
-                kv.second->txn->EndTransaction();
-            }
-            g_engine->GetSessionManager()->DestroySessionContext(kv.second->session);
-            delete kv.second;
+        if (!g.conns.empty()) {
+            fprintf(stderr,
+                "[oro-mot] shutdown: %zu connections still active; "
+                "skipping per-conn cleanup\n", g.conns.size());
         }
-        g.conns.clear();
         g.tables.clear();
     }
     MOTEngine::DestroyInstance();

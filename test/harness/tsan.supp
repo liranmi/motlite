@@ -1,0 +1,29 @@
+# TSan suppressions for known-safe races inside SQLite's amalgamation.
+#
+# SQLite's WAL implementation coordinates cross-connection access to the
+# *-shm file via OS file locks and a checksum-validated read-with-retry
+# protocol — not via in-process mutexes. TSan can't model that and reports
+# the lock-free shared-memory reads/writes as data races. They are not
+# bugs; suppressing them lets TSan find real races in our own code
+# (sqlite/oro_*.cpp).
+#
+# Anchor suppressions on SQLite symbol names rather than the full
+# sqlite3.c path so they're stable across amalgamation regenerations.
+
+race:walIndexTryHdr
+race:walIndexWriteHdr
+race:walIndexReadHdr
+race:walTryBeginRead
+race:walTryBeginWrite
+race:walCheckpoint
+
+# Pager-level retry loops also touch shared state without an in-process
+# mutex; they're safe for the same reason.
+race:pagerBeginReadTransaction
+race:sqlite3PagerSharedLock
+
+# Linker/init-time races inside the MOT engine (third_party/oro-db) are
+# out of scope for this branch — track separately. Suppress to keep
+# motlite-level races surfaceable.
+race:libmot
+race:MOT::

@@ -1124,6 +1124,11 @@ done:
     // Tear down extended-protocol state.
     for (auto& kv : sc.portals) closePortal(kv.second);
     for (auto& kv : sc.prepared) closePrepared(kv.second);
+    // Detach the MOT connection BEFORE closing sqlite3 so the per-conn MOT
+    // session/txn is torn down on this thread (the one that owns it). Skipping
+    // this leaks OroMotConn into the global registry and races with
+    // oroMotShutdown if the process is exiting.
+    oroMotConnDetach(db);
     sqlite3_close(db);
     close(fd);
 }
