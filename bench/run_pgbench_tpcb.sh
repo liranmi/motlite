@@ -96,3 +96,37 @@ if [[ $status -ne 0 ]]; then
     exit 1
 fi
 echo "OK: tps=$tps_val >= min=$MIN_TPS"
+
+# =====================================================================
+# Correctness oracle: TPC-B's invariant is that every transaction applies
+# `delta` to one accounts row, one tellers row, one branches row, AND
+# inserts that delta into pgbench_history. So after the run, the four
+# sums must all be equal. Drift implies a lost UPDATE, a partial commit,
+# an MVCC visibility bug, or a backfill that missed a row.
+# =====================================================================
+echo "== correctness check =="
+sums="$(PGPASSWORD=t psql -h localhost -p "$PORT" -U t -d t -At -F '|' -c "
+    SELECT
+        (SELECT COALESCE(sum(abalance),0) FROM pgbench_accounts),
+        (SELECT COALESCE(sum(tbalance),0) FROM pgbench_tellers),
+        (SELECT COALESCE(sum(bbalance),0) FROM pgbench_branches),
+        (SELECT COALESCE(sum(delta),0)    FROM pgbench_history),
+        (SELECT count(*) FROM pgbench_history)
+")"
+IFS='|' read -r sum_a sum_t sum_b sum_h n_hist <<<"$sums"
+echo "  sum(accounts.abalance) = $sum_a"
+echo "  sum(tellers.tbalance)  = $sum_t"
+echo "  sum(branches.bbalance) = $sum_b"
+echo "  sum(history.delta)     = $sum_h"
+echo "  count(history)         = $n_hist"
+
+if [[ "$sum_a" != "$sum_t" || "$sum_t" != "$sum_b" || "$sum_b" != "$sum_h" ]]; then
+    echo "FAIL: TPC-B invariant violated — the four sums must be equal" >&2
+    exit 1
+fi
+# Also sanity-check that we actually did some work.
+if [[ "$n_hist" == "0" ]]; then
+    echo "FAIL: pgbench_history is empty — no transactions ran" >&2
+    exit 1
+fi
+echo "OK: TPC-B invariant holds (a==t==b==h=$sum_a across $n_hist transactions)"
