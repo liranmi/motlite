@@ -1258,15 +1258,229 @@ static OroMotIdxInfo* LookupIdx(int iDb, const char* tabName,
     return (it != g.sec_indexes.end()) ? &it->second : nullptr;
 }
 
+// =====================================================================
+// SQLite record encoder for CREATE INDEX backfill
+// =====================================================================
+//
+// SQLite's index records are stored in the on-disk record format:
+//   [header_len_varint][serial_type_varint per col][payload bytes per col]
+//
+// We rebuild this format from sqlite3_column_* values so the resulting
+// blob is byte-identical to what OP_MakeRecord would produce during a
+// normal INSERT — it then flows through the existing oroMotIdxInsert path,
+// which already encodes the MOT key via oroMotEncodeIdxRecord.
+
+static int sqliteVarintLen(uint64_t v) {
+    if (v <= 0x7F) return 1;
+    if (v <= 0x3FFF) return 2;
+    if (v <= 0x1FFFFF) return 3;
+    if (v <= 0xFFFFFFF) return 4;
+    if (v <= 0x7FFFFFFFFULL) return 5;
+    if (v <= 0x3FFFFFFFFFFULL) return 6;
+    if (v <= 0x1FFFFFFFFFFFFULL) return 7;
+    if (v <= 0xFFFFFFFFFFFFFFULL) return 8;
+    return 9;
+}
+
+// Write SQLite varint, returns bytes written.
+static int sqliteVarintPut(uint8_t* out, uint64_t v) {
+    if (v <= 0x7F) { out[0] = (uint8_t)v; return 1; }
+    uint8_t buf[10];
+    int n = 0;
+    if (v >> 56) {
+        buf[n++] = (uint8_t)(v >> 56);
+        v &= 0x00FFFFFFFFFFFFFFULL;
+    }
+    for (int shift = 49; shift >= 0; shift -= 7) {
+        uint64_t chunk = (v >> shift) & 0x7F;
+        if (n > 0 || chunk || shift == 0) {
+            buf[n++] = (uint8_t)(chunk | 0x80);
+        }
+    }
+    buf[n - 1] &= 0x7F;
+    memcpy(out, buf, n);
+    return n;
+}
+
+// Returns serial type code and (out) payload size in bytes for a value
+// at column `col` of `stmt`. Handles NULL/INT/REAL/TEXT/BLOB.
+static int64_t serialTypeFor(sqlite3_stmt* stmt, int col, int* payload_bytes) {
+    int t = sqlite3_column_type(stmt, col);
+    if (t == SQLITE_NULL) { *payload_bytes = 0; return 0; }
+    if (t == SQLITE_INTEGER) {
+        int64_t v = sqlite3_column_int64(stmt, col);
+        if (v == 0) { *payload_bytes = 0; return 8; }
+        if (v == 1) { *payload_bytes = 0; return 9; }
+        if (v >= -128 && v <= 127)              { *payload_bytes = 1; return 1; }
+        if (v >= -32768 && v <= 32767)          { *payload_bytes = 2; return 2; }
+        if (v >= -(1<<23) && v <= ((1<<23) - 1)){ *payload_bytes = 3; return 3; }
+        if (v >= INT32_MIN && v <= INT32_MAX)   { *payload_bytes = 4; return 4; }
+        if (v >= -(1LL<<47) && v <= ((1LL<<47)-1)){ *payload_bytes = 6; return 5; }
+        *payload_bytes = 8; return 6;
+    }
+    if (t == SQLITE_FLOAT) { *payload_bytes = 8; return 7; }
+    if (t == SQLITE_BLOB)  {
+        int n = sqlite3_column_bytes(stmt, col);
+        *payload_bytes = n; return 12 + 2 * (int64_t)n;
+    }
+    // SQLITE_TEXT (and default)
+    int n = sqlite3_column_bytes(stmt, col);
+    *payload_bytes = n; return 13 + 2 * (int64_t)n;
+}
+
+// Write the payload bytes (big-endian for integers, big-endian double, raw
+// bytes for blob/text) for the value at column `col` of `stmt`.
+static void serialWritePayload(sqlite3_stmt* stmt, int col, int64_t st,
+                               int payload_bytes, uint8_t* out) {
+    if (st == 0 || st == 8 || st == 9) return;
+    if (st >= 1 && st <= 6) {
+        int64_t v = sqlite3_column_int64(stmt, col);
+        for (int i = payload_bytes - 1; i >= 0; i--) {
+            out[i] = (uint8_t)(v & 0xFF);
+            v >>= 8;
+        }
+        return;
+    }
+    if (st == 7) {
+        double d = sqlite3_column_double(stmt, col);
+        uint64_t u;
+        memcpy(&u, &d, 8);
+        for (int i = 7; i >= 0; i--) {
+            out[i] = (uint8_t)(u & 0xFF);
+            u >>= 8;
+        }
+        return;
+    }
+    // BLOB or TEXT — copy raw bytes
+    const void* p = (st >= 13 && (st & 1))
+                        ? (const void*)sqlite3_column_text(stmt, col)
+                        : sqlite3_column_blob(stmt, col);
+    if (p && payload_bytes > 0) memcpy(out, p, payload_bytes);
+}
+
+// Build a SQLite record from columns [0..nCols) of the stepped statement.
+// Writes into `out` (must be >= MAX_RECORD_SIZE). Returns bytes written, or
+// -1 on overflow.
+static int buildSqliteIndexRecord(sqlite3_stmt* stmt, int nCols,
+                                  uint8_t* out, int outSize) {
+    int64_t st[64];
+    int pl[64];
+    if (nCols > 64) return -1;
+    int bodyBytes = 0;
+    for (int i = 0; i < nCols; i++) {
+        st[i] = serialTypeFor(stmt, i, &pl[i]);
+        bodyBytes += pl[i];
+    }
+    int typeHdrBytes = 0;
+    for (int i = 0; i < nCols; i++) typeHdrBytes += sqliteVarintLen((uint64_t)st[i]);
+    // header length itself is varint-encoded; iterate to find a stable size.
+    int hdrLenBytes = sqliteVarintLen((uint64_t)(typeHdrBytes + 1));
+    int prev = 0;
+    while (prev != hdrLenBytes) {
+        prev = hdrLenBytes;
+        hdrLenBytes = sqliteVarintLen((uint64_t)(typeHdrBytes + hdrLenBytes));
+    }
+    int total = hdrLenBytes + typeHdrBytes + bodyBytes;
+    if (total > outSize) return -1;
+
+    int pos = 0;
+    pos += sqliteVarintPut(out + pos, (uint64_t)(hdrLenBytes + typeHdrBytes));
+    for (int i = 0; i < nCols; i++) {
+        pos += sqliteVarintPut(out + pos, (uint64_t)st[i]);
+    }
+    for (int i = 0; i < nCols; i++) {
+        serialWritePayload(stmt, i, st[i], pl[i], out + pos);
+        pos += pl[i];
+    }
+    return pos;
+}
+
+// Backfill an existing MOT secondary index with every row currently in
+// the primary table. Caller supplies the column names — we can't rely on
+// PRAGMA index_info because this runs at SQLite parse-time, before the
+// index entry is in sqlite_schema, and it also runs from inside an
+// OP_ParseSchema callback where prepare-on-pragma misbehaves.
+//
+// Inserts are idempotent (oroMotIdxInsert returns RC_UNIQUE_VIOLATION on
+// duplicates), so calling this multiple times is safe.
+extern "C" int oroMotIndexBackfill(void* pDb, int iDb, const char* table_name,
+                                   const char* index_name,
+                                   const char* const* col_names, int n_cols) {
+    if (!pDb || !table_name || !index_name || n_cols <= 0) return 0;
+    sqlite3* db = (sqlite3*)pDb;
+    OroMotConn* c = GetOrCreateConn(pDb);
+    if (!c) return -1;
+    EnsureThreadCtx(c);
+
+    // Build SELECT col1, col2, ..., rowid FROM <table>.
+    std::string proj;
+    for (int i = 0; i < n_cols; i++) {
+        if (i > 0) proj += ", ";
+        proj += "\"";
+        proj += col_names[i];
+        proj += "\"";
+    }
+    char* zSel = sqlite3_mprintf("SELECT %s, rowid FROM %Q",
+                                 proj.c_str(), table_name);
+    if (!zSel) return -1;
+    sqlite3_stmt* sel = nullptr;
+    int rc = sqlite3_prepare_v2(db, zSel, -1, &sel, nullptr);
+    sqlite3_free(zSel);
+    if (rc != SQLITE_OK) return -1;
+
+    OroMotCursor* idxCur = nullptr;
+    if (oroMotIdxCursorOpen(pDb, iDb, table_name, index_name, /*wrFlag=*/1,
+                            &idxCur) != 0 || !idxCur) {
+        sqlite3_finalize(sel);
+        return -1;
+    }
+
+    int nRecCols = n_cols + 1;  // + rowid
+    uint8_t recBuf[MAX_RECORD_SIZE];
+    int inserted = 0, dups = 0, errs = 0;
+    while (sqlite3_step(sel) == SQLITE_ROW) {
+        int nRec = buildSqliteIndexRecord(sel, nRecCols, recBuf, sizeof(recBuf));
+        if (nRec < 0) { errs++; continue; }
+        uint8_t encKey[ORO_MOT_IDX_KEY_LEN];
+        int64_t rid = 0;
+        if (oroMotEncodeIdxRecord(recBuf, nRec, encKey, &rid) != 0) { errs++; continue; }
+        int ir = oroMotIdxInsert(idxCur, encKey, rid, recBuf, nRec);
+        if (ir == 0) inserted++;
+        else if (ir == 2) dups++;  // already in index — backfill is idempotent
+        else errs++;
+    }
+    sqlite3_finalize(sel);
+    oroMotCursorClose(idxCur);
+    return errs > 0 ? -1 : inserted;
+}
+
 extern "C" int oroMotIndexCreate(void* pDb, int iDb, const char* table_name,
                                  const char* index_name) {
     if (!g_initialized.load() || !table_name || !index_name) return 1;
+    fprintf(stderr, "[oro-mot] oroMotIndexCreate(%s.%s) called\n",
+            table_name, index_name);
 
     auto& g = globals();
+    bool fresh_create = true;
     {
         std::lock_guard<std::mutex> lock(g.mu);
         IdxKey ik{iDb, table_name, index_name};
-        if (g.sec_indexes.count(ik)) return 0;  // already exists
+        if (g.sec_indexes.count(ik)) {
+            fresh_create = false;
+            // Don't return yet — backfill is run at the end since the
+            // FIRST call happens at codegen time when sqlite_schema doesn't
+            // yet have the index entry (PRAGMA index_info would return
+            // empty), so the backfill we'd attempt at that moment is a
+            // no-op. The second call (from OP_ParseSchema after the schema
+            // insert) is the one that actually populates the index.
+            // oroMotIdxInsert returns RC_UNIQUE_VIOLATION on duplicates,
+            // which backfillSecondaryIndex treats as success — so calling
+            // backfill twice is safe and idempotent.
+        }
+    }
+    if (!fresh_create) {
+        backfillSecondaryIndex(pDb, iDb, table_name, index_name);
+        return 0;
     }
 
     EnsureThreadCtx(nullptr);
@@ -1360,6 +1574,12 @@ extern "C" int oroMotIndexCreate(void* pDb, int iDb, const char* table_name,
         std::lock_guard<std::mutex> lock(g.mu);
         g.sec_indexes[IdxKey{iDb, table_name, index_name}] = OroMotIdxInfo{t, ix};
     }
+
+    // Backfill rows that existed before this CREATE INDEX (GAPS.md #11).
+    // Failure here is non-fatal: the index is still usable, just incomplete.
+    // Caller will see the empty index on a subsequent SELECT and the result
+    // mismatch will be obvious in testing.
+    backfillSecondaryIndex(pDb, iDb, table_name, index_name);
     return 0;
 }
 
