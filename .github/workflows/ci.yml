@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel an in-flight run when a new commit lands on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =====================================================================
+  # Build + unit tests + libpq harness modes that don't need concurrency.
+  # =====================================================================
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential cmake libssl-dev libpq-dev postgresql-client
+
+      - name: Configure + build (debug)
+        run: make debug
+
+      - name: Run motlite_test (engine integration tests)
+        run: ./build/debug/motlite_test
+
+      - name: Smoke + extended + delete_loop harness modes
+        run: |
+          set -euo pipefail
+          ./test/harness/oro_server_runner.sh start --port 5610 \
+              --db /tmp/ci_smoke.db --log /tmp/ci_smoke.log --pidfile /tmp/ci_smoke.pid
+          ./test/harness/oro_server_runner.sh wait-ready --port 5610 --pidfile /tmp/ci_smoke.pid
+          ./build/debug/harness_libpq_load --port 5610 --mode smoke
+          ./build/debug/harness_libpq_load --port 5610 --mode extended
+          ./build/debug/harness_libpq_load --port 5610 --mode delete_loop
+          ./test/harness/oro_server_runner.sh stop --pidfile /tmp/ci_smoke.pid
+
+  # =====================================================================
+  # Concurrency hardening: native-oracle, mixed-load stress, DDL+load.
+  # =====================================================================
+  concurrency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential cmake libssl-dev libpq-dev postgresql-client
+      - name: Build (debug)
+        run: make debug
+      - name: Native-oracle (MOT vs SQLite, bit-exact)
+        run: make oracle
+      - name: Mixed-load stress (16 threads, 10s)
+        run: ./test/harness/run_concurrency_check.sh build/debug stress --threads 16 --duration 10
+      - name: DDL + load stress (16 threads + 1 DDL, 10s)
+        run: ./test/harness/run_concurrency_check.sh build/debug stress_ddl --threads 16 --duration 10
+
+  # =====================================================================
+  # Crash recovery: kill -9 oracle.
+  # =====================================================================
+  crash-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential cmake libssl-dev libpq-dev postgresql-client
+      - name: Build (debug)
+        run: make debug
+      - name: Run 5 kill -9 iterations
+        run: ./test/harness/run_crash_loop.sh 5 --port 5620
+
+  # =====================================================================
+  # pgbench TPC-B against MOT tables — proves the wire protocol + planner +
+  # index-backed writes survive a realistic OLTP workload. CI uses a small
+  # 1000-account dataset and a 10s run so the job stays under a minute.
+  # Concurrency is 1 client only: TPC-B's single-branch design creates
+  # hot-row contention on pgbench_branches that's a workload issue, not a
+  # motlite regression — see GAPS.md and the discussion in PR #3.
+  # =====================================================================
+  pgbench-tpcb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps + pgbench
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential cmake libssl-dev libpq-dev postgresql-client
+      - name: Build (debug)
+        run: make debug
+      - name: pgbench TPC-B (1 client, 10s)
+        run: ./bench/run_pgbench_tpcb.sh --clients 1 --threads 1 --duration 10 --min-tps 20
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpcb-server-log
+          path: /tmp/motlite_tpcb.log
