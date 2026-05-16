@@ -424,6 +424,58 @@ static void TestIndexLookup() {
     TEST_ASSERT(r.rows[3][0] == "18", "last id = 18");
 }
 
+// --- CREATE INDEX backfill (GAPS.md #11) ---
+//
+// When CREATE INDEX runs on a populated MOT table, every existing row must
+// be inserted into the new secondary index. Without backfill the index is
+// born empty and SELECT ... WHERE indexed_col = X returns zero rows even
+// though the row exists.
+
+static void TestCreateIndexBackfill() {
+    SetupDb();
+    auto r = ExecSql(g_db,
+        "CREATE MOT TABLE t_bf (id INTEGER PRIMARY KEY, v INTEGER, payload TEXT)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create");
+
+    // Insert 200 rows BEFORE the index exists. Deterministic v values so
+    // assertions can be exact.
+    for (int i = 1; i <= 200; i++) {
+        char sql[128];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO t_bf VALUES (%d, %d, 'p%d')", i, i * 10, i);
+        ExecSql(g_db, sql);
+    }
+
+    // Sanity: full-scan finds 200 rows.
+    r = ExecSql(g_db, "SELECT count(*) FROM t_bf");
+    TEST_ASSERT(r.rows[0][0] == "200", "200 rows before CREATE INDEX");
+
+    // Create the index. Backfill must populate it from the existing rows.
+    r = ExecSql(g_db, "CREATE INDEX t_bf_v_idx ON t_bf(v)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create index");
+
+    // Equality on an indexed column that exists.
+    r = ExecSql(g_db, "SELECT id FROM t_bf WHERE v = 500");
+    TEST_ASSERT(r.rows.size() == 1, "1 row with v=500 (was row id=50)");
+    TEST_ASSERT(r.rows[0][0] == "50", "id=50 matches");
+
+    // Range scan: v >= 1000 AND v < 1100 → rows with v in [1000, 1090],
+    // which is ids 100..109 = 10 rows.
+    r = ExecSql(g_db, "SELECT count(*) FROM t_bf WHERE v >= 1000 AND v < 1100");
+    TEST_ASSERT(r.rows[0][0] == "10", "10 rows in [1000, 1100)");
+
+    // Backwards-bound (LT): v < 50 → only v=10,20,30,40 = 4 rows.
+    r = ExecSql(g_db, "SELECT count(*) FROM t_bf WHERE v < 50");
+    TEST_ASSERT(r.rows[0][0] == "4", "4 rows with v < 50");
+
+    // Add a row AFTER the index exists. The normal OP_IdxInsert path must
+    // keep the index in sync.
+    ExecSql(g_db, "INSERT INTO t_bf VALUES (201, 2010, 'new')");
+    r = ExecSql(g_db, "SELECT id FROM t_bf WHERE v = 2010");
+    TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "201",
+                "post-CREATE INDEX insert is indexed");
+}
+
 // --- Rowid allocation after DELETEs ---
 
 static void TestRowidAfterDelete() {
@@ -992,6 +1044,7 @@ int main(int argc, char* argv[]) {
     RUN_TEST(TestTriggers);
     RUN_TEST(TestForeignKeys);
     RUN_TEST(TestReadYourOwnWrites);
+    RUN_TEST(TestCreateIndexBackfill);
 
     printf("\n[Part 5] Backup and restore (WAL)\n");
     RUN_TEST(TestWalBasic);

@@ -1457,30 +1457,12 @@ extern "C" int oroMotIndexBackfill(void* pDb, int iDb, const char* table_name,
 extern "C" int oroMotIndexCreate(void* pDb, int iDb, const char* table_name,
                                  const char* index_name) {
     if (!g_initialized.load() || !table_name || !index_name) return 1;
-    fprintf(stderr, "[oro-mot] oroMotIndexCreate(%s.%s) called\n",
-            table_name, index_name);
 
     auto& g = globals();
-    bool fresh_create = true;
     {
         std::lock_guard<std::mutex> lock(g.mu);
         IdxKey ik{iDb, table_name, index_name};
-        if (g.sec_indexes.count(ik)) {
-            fresh_create = false;
-            // Don't return yet — backfill is run at the end since the
-            // FIRST call happens at codegen time when sqlite_schema doesn't
-            // yet have the index entry (PRAGMA index_info would return
-            // empty), so the backfill we'd attempt at that moment is a
-            // no-op. The second call (from OP_ParseSchema after the schema
-            // insert) is the one that actually populates the index.
-            // oroMotIdxInsert returns RC_UNIQUE_VIOLATION on duplicates,
-            // which backfillSecondaryIndex treats as success — so calling
-            // backfill twice is safe and idempotent.
-        }
-    }
-    if (!fresh_create) {
-        backfillSecondaryIndex(pDb, iDb, table_name, index_name);
-        return 0;
+        if (g.sec_indexes.count(ik)) return 0;  // already exists, idempotent
     }
 
     EnsureThreadCtx(nullptr);
@@ -1574,12 +1556,10 @@ extern "C" int oroMotIndexCreate(void* pDb, int iDb, const char* table_name,
         std::lock_guard<std::mutex> lock(g.mu);
         g.sec_indexes[IdxKey{iDb, table_name, index_name}] = OroMotIdxInfo{t, ix};
     }
-
-    // Backfill rows that existed before this CREATE INDEX (GAPS.md #11).
-    // Failure here is non-fatal: the index is still usable, just incomplete.
-    // Caller will see the empty index on a subsequent SELECT and the result
-    // mismatch will be obvious in testing.
-    backfillSecondaryIndex(pDb, iDb, table_name, index_name);
+    // Backfill is driven separately via oroMotIndexBackfill (called from
+    // sqlite3.c with explicit column names, since at this point we may be
+    // at parse-time codegen when sqlite_schema doesn't yet have the index
+    // entry — making PRAGMA index_info return empty).
     return 0;
 }
 

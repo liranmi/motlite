@@ -134,21 +134,28 @@ which is idempotent (UNIQUE_VIOLATION on replayed INSERT counts as success).
 
 ## Significant (workarounds exist, but rough edges)
 
-### 8. Query planner doesn't use MOT secondary indexes
-**Status**: indexes are maintained but never used for reads
+### 8. ~~Query planner doesn't use MOT secondary indexes~~ — WAS ALREADY WIRED
+**Status**: misdiagnosed; the wiring works.
 
-SQLite's optimizer has no awareness of MOT's MassTree indexes. Every
-`WHERE col = X` on a MOT table does a full scan + filter, even with a
-secondary index.
+Empirical EXPLAIN against `SELECT … WHERE col = X` on a MOT table with a
+secondary index emits the correct opcode stream:
+`OpenRead-idx; SeekGE; IdxGT; DeferredSeek; Column`. The SQLite planner
+already picks the index, and all the VDBE dispatches it needs
+(`OP_OpenRead`/`OpenWrite` on index, `OP_SeekGE/GT/LE/LT`, `OP_IdxGT`,
+`OP_IdxRowid`, `OP_Column` post-deferred-seek) have CURTYPE_MOT branches
+in `third_party/sqlite/sqlite3.c`.
 
-**Impact**: indexes help UNIQUE constraint enforcement but not query
-performance. Misleading to users.
+The symptom — "indexed lookup returns no rows" — was actually
+[#11](#11-no-create-index-backfill--fixed-in-session): the index existed
+empty because `CREATE INDEX` on populated data didn't backfill. Once #11
+is fixed, equality and bounded-range queries work end-to-end.
 
-**Fix direction**: either (a) teach the adapter to detect simple
-equality predicates and serve them directly from the MOT index (this
-requires VDBE cooperation), or (b) register MOT tables as SQLite
-virtual tables with `xBestIndex` — but we moved away from vtables
-deliberately.
+**Remaining sharp edge**: `oroMotIdxSeek`'s LT/LE branches at
+`sqlite/oro_mot_adapter.cpp:1566-1593` are O(N) on the initial seek (they
+walk from `Begin()` linearly to find the boundary). Test coverage confirms
+correctness for `WHERE v < 50` over 200 rows, but on 100 000-row tables
+the seek itself is slow. Forward ranges (`>=`/`>` lower bound + iterate +
+compare on upper bound) are proper O(log N + K).
 
 ---
 
@@ -176,14 +183,36 @@ reference main (currently forbidden), or (c) invalidate cache on DDL.
 
 ---
 
-### 11. No CREATE INDEX backfill
-**Status**: must create indexes before data
+### 11. ~~No CREATE INDEX backfill~~ — FIXED (in-session)
+**Status**: in-session CREATE INDEX on a populated MOT table now backfills.
 
-If you `CREATE INDEX` on a MOT table that already has rows, the index
-stays empty. Only new rows land in it.
+`oroMotIndexBackfill` in `sqlite/oro_mot_adapter.cpp` opens a prepared
+`SELECT col1, …, rowid FROM table`, rebuilds the SQLite record format from
+each `sqlite3_column_*` via a small encoder (`buildSqliteIndexRecord` and
+helpers), then drives `oroMotIdxInsert` per row. `oroMotEncodeIdxRecord`
+generates the encoded MOT key from the same record. Idempotent
+(`RC_UNIQUE_VIOLATION` is treated as success).
 
-**Fix direction**: after creating the MOT index, walk the primary table's
-rows and insert into the new index. ~30 LOC.
+Called from `third_party/sqlite/sqlite3.c` at the DDL site (line ~127187)
+with explicit column names from `pIndex->aiColumn` + `pTab->aCol[].zCnName`.
+The `sqlite3RefillIndex` path stays skipped for MOT tables because its
+`OP_OpenWrite`-on-index matches the MOT dispatch by `pIdx->tnum`, which
+isn't set to the rootpage until `OP_ParseSchema` runs later in the same
+VDBE program.
+
+Regression: `TestCreateIndexBackfill` in `test/test_mot_engine.cpp`
+covers equality, forward range (`>=` AND `<`), backward open-bound (`<`),
+and a post-create INSERT to confirm `OP_IdxInsert` still maintains the
+index for new rows.
+
+**Known remaining gap (separate from #11, tracked here)**: cross-restart
+secondary indexes are still empty. WAL replay applies primary-table
+inserts via `oroMotInsert` but doesn't fan out to secondary indexes; on
+reopen, schema reload re-runs `CREATE INDEX` and the new
+`oroMotIndexBackfill` call, but at that moment the primary MOT table is
+also empty (recovery hasn't run yet). Fixing this needs either
+post-recovery backfill in `handleClient`, or making WAL replay drive
+secondary-index updates the same way live writes do.
 
 ---
 
