@@ -43,6 +43,13 @@
 // Global users table (read once at startup). Empty => trust mode.
 static OroUsers g_users;
 
+// When --no-wal is passed, skip oroMotWalEnable on each connection.
+// MOT INSERT/DELETE then bypass the _mot_wal layer entirely, removing
+// the SQLite write-lock contention that bottlenecks concurrent writers.
+// Trade-off: MOT state is not persisted, so server restarts lose data.
+// Intended for benchmarking and CI; production deployments keep WAL on.
+static bool g_no_wal = false;
+
 // =====================================================================
 // PG wire protocol helpers
 // =====================================================================
@@ -163,6 +170,38 @@ static bool sendErrorResponse(int fd, const char* severity,
 
 // Forward decl — definition lives after sendEmptyQuery.
 static int32_t pgTypeOidForStmtCol(sqlite3_stmt* stmt, int col);
+
+// Map a SQLite (extended) error code to a PG SQLSTATE so clients like
+// pgbench --max-tries can distinguish retryable failures (40001) from
+// permanent ones (23505, 42000). Returns a static string.
+//
+// Side effect: on a retryable serialization failure (40001), rolls back
+// the underlying SQLite txn if one is open. Without this, the client's
+// retry attempt sends BEGIN and gets "cannot start a transaction within
+// a transaction" because the failed statement left the txn half-open.
+// Real PG implicitly aborts the txn on this error class; we mimic that.
+static const char* pgSqlstateForSqliteRc(sqlite3* db) {
+    if (!db) return "42000";
+    int xrc = sqlite3_extended_errcode(db);
+    int prim = xrc & 0xFF;
+    auto rollbackIfInTxn = [&]() {
+        if (sqlite3_get_autocommit(db) == 0) {
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        }
+    };
+    if (prim == SQLITE_BUSY)   { rollbackIfInTxn(); return "40001"; }
+    if (prim == SQLITE_LOCKED) { rollbackIfInTxn(); return "40001"; }
+    if (prim == SQLITE_CONSTRAINT) {
+        // SQLITE_CONSTRAINT_UNIQUE (2067), SQLITE_CONSTRAINT_PRIMARYKEY (1555).
+        if (xrc == SQLITE_CONSTRAINT_UNIQUE ||
+            xrc == SQLITE_CONSTRAINT_PRIMARYKEY) return "23505";
+        if (xrc == SQLITE_CONSTRAINT_NOTNULL)    return "23502";
+        if (xrc == SQLITE_CONSTRAINT_FOREIGNKEY) return "23503";
+        if (xrc == SQLITE_CONSTRAINT_CHECK)      return "23514";
+        return "23000";  // generic integrity constraint
+    }
+    return "42000";  // syntax / generic
+}
 
 static bool sendRowDescription(int fd, int ncols, const char** names) {
     PgMsg m;
@@ -344,7 +383,8 @@ static int execOneStmt(int fd, sqlite3* db, sqlite3_stmt* stmt, const char* firs
             } else if (rc == SQLITE_DONE) {
                 break;
             } else {
-                sendErrorResponse(fd, "ERROR", "42000", sqlite3_errmsg(db));
+                sendErrorResponse(fd, "ERROR", pgSqlstateForSqliteRc(db),
+                                  sqlite3_errmsg(db));
                 return 0;
             }
         }
@@ -355,7 +395,8 @@ static int execOneStmt(int fd, sqlite3* db, sqlite3_stmt* stmt, const char* firs
         // DDL/DML: step once
         int rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
-            sendErrorResponse(fd, "ERROR", "42000", sqlite3_errmsg(db));
+            sendErrorResponse(fd, "ERROR", pgSqlstateForSqliteRc(db),
+                              sqlite3_errmsg(db));
             return 0;
         }
         const char* tag = "OK";
@@ -439,7 +480,8 @@ static void handleQuery(int fd, sqlite3* db, const char* sql) {
     char* errmsg = nullptr;
     int rc = sqlite3_exec(db, rewritten.c_str(), queryCallback, &qs, &errmsg);
     if (rc != SQLITE_OK) {
-        sendErrorResponse(fd, "ERROR", "42000", errmsg ? errmsg : "?");
+        sendErrorResponse(fd, "ERROR", pgSqlstateForSqliteRc(db),
+                          errmsg ? errmsg : "?");
         if (errmsg) sqlite3_free(errmsg);
     } else if (!qs.header_sent) {
         const char* tag = "OK";
@@ -478,7 +520,7 @@ static void handleQueryLegacy(int fd, sqlite3* db, const char* sql) {
     int rc = sqlite3_exec(db, rewritten.c_str(), queryCallback, &qs, &errmsg);
     if (rc != SQLITE_OK) {
         const char* msg = errmsg ? errmsg : "unknown error";
-        sendErrorResponse(fd, "ERROR", "42000", msg);
+        sendErrorResponse(fd, "ERROR", pgSqlstateForSqliteRc(db), msg);
         if (errmsg) sqlite3_free(errmsg);
     } else {
         if (!qs.header_sent) {
@@ -603,7 +645,7 @@ static int handleParse(ServerConn& sc, int fd,
     std::string rewritten = oroPgRewriteQuery(query.c_str());
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(sc.db, rewritten.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-        extFlagError(sc, fd, "42000", sqlite3_errmsg(sc.db));
+        extFlagError(sc, fd, pgSqlstateForSqliteRc(sc.db), sqlite3_errmsg(sc.db));
         return 0;
     }
     auto it = sc.prepared.find(name);
@@ -817,7 +859,7 @@ static int handleExecute(ServerConn& sc, int fd,
         // DDL/DML — step once, emit CommandComplete.
         int rc = sqlite3_step(stmt);
         if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
-            extFlagError(sc, fd, "42000", sqlite3_errmsg(sc.db));
+            extFlagError(sc, fd, pgSqlstateForSqliteRc(sc.db), sqlite3_errmsg(sc.db));
             return 0;
         }
         const char* sql = sqlite3_sql(stmt);
@@ -876,7 +918,7 @@ static int handleExecute(ServerConn& sc, int fd,
             pt.nrows = 0;
             return 0;
         } else {
-            extFlagError(sc, fd, "42000", sqlite3_errmsg(sc.db));
+            extFlagError(sc, fd, pgSqlstateForSqliteRc(sc.db), sqlite3_errmsg(sc.db));
             sqlite3_reset(stmt);
             return 0;
         }
@@ -1041,8 +1083,10 @@ static void handleClient(int fd, const char* dbPath) {
     }
     sqlite3_exec(db, "PRAGMA busy_timeout = 5000", nullptr, nullptr, nullptr);
 
-    // Enable MOT WAL persistence for file-backed databases
-    if (strcmp(dbPath, ":memory:") != 0) {
+    // Enable MOT WAL persistence for file-backed databases. Skipped when
+    // --no-wal is set — MOT runs purely in-memory, no _mot_wal writes,
+    // no SQLite write-lock contention on the MOT path.
+    if (strcmp(dbPath, ":memory:") != 0 && !g_no_wal) {
         oroMotWalEnable(db);
         oroMotWalRecover(db);
     }
@@ -1157,6 +1201,8 @@ int main(int argc, char* argv[]) {
             motConfig = argv[++i];
         } else if (strcmp(argv[i], "--users") == 0 && i + 1 < argc) {
             usersFile = argv[++i];
+        } else if (strcmp(argv[i], "--no-wal") == 0) {
+            g_no_wal = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             fprintf(stderr,
                 "Usage: %s [options]\n"
