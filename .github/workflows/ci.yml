@@ -44,6 +44,9 @@ jobs:
           ./build/debug/harness_libpq_load --port 5610 --mode delete_loop
           ./test/harness/oro_server_runner.sh stop --pidfile /tmp/ci_smoke.pid
 
+      - name: COPY protocol check (text + CSV, FROM + TO)
+        run: ./test/harness/run_copy_check.sh build/debug
+
   # =====================================================================
   # Concurrency hardening: native-oracle, mixed-load stress, DDL+load.
   # =====================================================================

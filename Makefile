@@ -46,5 +46,8 @@ oracle: debug
 test: debug
 	./$(BUILD_DIR)/debug/motlite_test
 
+copy-test: debug
+	./test/harness/run_copy_check.sh $(BUILD_DIR)/debug
+
 clean:
 	rm -rf build

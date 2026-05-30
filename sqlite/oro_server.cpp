@@ -385,6 +385,474 @@ static int execOneStmt(int fd, sqlite3* db, sqlite3_stmt* stmt, const char* firs
     return 0;
 }
 
+// =====================================================================
+// COPY protocol (text + CSV), simple-query path only.
+//
+// Supports:  COPY tab [(cols)] TO   STDOUT [WITH] [(opts)] [CSV ...]
+//            COPY (query)      TO   STDOUT ...
+//            COPY tab [(cols)] FROM STDIN  [WITH] [(opts)] [CSV ...]
+// Options recognized (legacy keyword form and WITH(...) form): CSV/FORMAT,
+// HEADER, DELIMITER 'x', NULL 'str'. Default text format is tab-delimited with
+// \N for NULL; CSV defaults to comma-delimited, empty-unquoted = NULL.
+// =====================================================================
+
+struct CopyOpts {
+    bool csv = false;
+    bool header = false;
+    char delim = '\t';
+    std::string null_str = "\\N";
+    bool delim_set = false;
+    bool null_set = false;
+};
+
+struct CopyField { bool is_null; std::string val; };
+
+static std::string sqlQuoteLiteral(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) { if (c == '\'') out += "''"; else out += c; }
+    out += "'";
+    return out;
+}
+
+// Append one field to a COPY TO output line, applying text or CSV escaping.
+static void copyAppendField(std::string& out, const char* val, int len,
+                            const CopyOpts& o) {
+    if (o.csv) {
+        bool need_quote = false;
+        for (int i = 0; i < len; i++) {
+            char c = val[i];
+            if (c == o.delim || c == '"' || c == '\n' || c == '\r') {
+                need_quote = true; break;
+            }
+        }
+        if (!need_quote) { out.append(val, len); return; }
+        out += '"';
+        for (int i = 0; i < len; i++) {
+            if (val[i] == '"') out += "\"\"";
+            else out += val[i];
+        }
+        out += '"';
+    } else {
+        for (int i = 0; i < len; i++) {
+            char c = val[i];
+            switch (c) {
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                default:   out += c;      break;
+            }
+        }
+    }
+}
+
+// Find a quoted value following a keyword in the (lowercased) options text,
+// reading the literal from the original-case string. Returns true if found.
+static bool copyFindQuoted(const std::string& orig, const std::string& lower,
+                           const char* keyword, std::string& out) {
+    size_t k = lower.find(keyword);
+    if (k == std::string::npos) return false;
+    size_t i = k + strlen(keyword);
+    while (i < orig.size() && (orig[i] == ' ' || orig[i] == '\t')) i++;
+    if (i >= orig.size() || orig[i] != '\'') return false;
+    i++;
+    out.clear();
+    while (i < orig.size()) {
+        if (orig[i] == '\'') {
+            if (i + 1 < orig.size() && orig[i + 1] == '\'') { out += '\''; i += 2; continue; }
+            return true;
+        }
+        out += orig[i++];
+    }
+    return false;
+}
+
+static void copyParseOptions(const std::string& optText, CopyOpts& o) {
+    std::string lower = optText;
+    for (char& c : lower) c = (char)tolower((unsigned char)c);
+    if (lower.find("csv") != std::string::npos ||
+        lower.find("format csv") != std::string::npos) {
+        o.csv = true;
+    }
+    // HEADER (ignore explicit "header false"/"header off").
+    size_t h = lower.find("header");
+    if (h != std::string::npos) {
+        size_t a = h + 6;
+        while (a < lower.size() && (lower[a] == ' ' || lower[a] == '\t')) a++;
+        bool off = (lower.compare(a, 5, "false") == 0) || (lower.compare(a, 3, "off") == 0);
+        if (!off) o.header = true;
+    }
+    std::string v;
+    if (copyFindQuoted(optText, lower, "delimiter", v) && !v.empty()) {
+        o.delim = v[0]; o.delim_set = true;
+    }
+    if (copyFindQuoted(optText, lower, "null", v)) {
+        o.null_str = v; o.null_set = true;
+    }
+    if (o.csv) {
+        if (!o.delim_set) o.delim = ',';
+        if (!o.null_str.empty() && !o.null_set) o.null_str = "";
+        if (!o.null_set) o.null_str = "";
+    }
+}
+
+struct CopyStmt {
+    bool valid = false;
+    bool is_from = false;       // FROM STDIN vs TO STDOUT
+    bool is_query = false;      // COPY (query) TO STDOUT
+    std::string target;         // table reference or query text
+    std::string table_name;     // unquoted table name (for pragma lookup)
+    std::vector<std::string> cols;
+    CopyOpts opts;
+};
+
+static std::string copyStripIdent(const std::string& s) {
+    std::string t = s;
+    while (!t.empty() && (t.front() == ' ' || t.front() == '\t')) t.erase(t.begin());
+    while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+    if (t.size() >= 2 && t.front() == '"' && t.back() == '"') t = t.substr(1, t.size() - 2);
+    // strip schema prefix for the bare name
+    size_t dot = t.rfind('.');
+    if (dot != std::string::npos) t = t.substr(dot + 1);
+    return t;
+}
+
+static bool copyParseStmt(const char* sql, CopyStmt& out) {
+    const char* p = sql;
+    auto skipws = [&]() { while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++; };
+    skipws();
+    if (strncasecmp(p, "COPY", 4) != 0) return false;
+    p += 4;
+    if (!(*p == ' ' || *p == '\t' || *p == '\n')) return false;
+    skipws();
+
+    if (*p == '(') {
+        // COPY (query) TO STDOUT
+        int depth = 0; const char* start = p;
+        while (*p) {
+            if (*p == '(') depth++;
+            else if (*p == ')') { depth--; if (depth == 0) { p++; break; } }
+            p++;
+        }
+        if (depth != 0) return false;
+        out.is_query = true;
+        out.target.assign(start + 1, p - 1);  // inside the parens
+    } else {
+        // table name (possibly "quoted" or schema.table), read until ws or '('
+        const char* start = p;
+        bool inq = false;
+        while (*p) {
+            if (*p == '"') inq = !inq;
+            else if (!inq && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '(')) break;
+            p++;
+        }
+        out.target.assign(start, p - start);
+        out.table_name = copyStripIdent(out.target);
+        skipws();
+        if (*p == '(') {
+            const char* cstart = ++p;
+            int depth = 1;
+            while (*p && depth) { if (*p == '(') depth++; else if (*p == ')') depth--; if (depth) p++; }
+            std::string cols(cstart, p - cstart);
+            if (*p == ')') p++;
+            // split on commas
+            std::string cur;
+            for (char c : cols) {
+                if (c == ',') { out.cols.push_back(copyStripIdent(cur)); cur.clear(); }
+                else cur += c;
+            }
+            if (!cur.empty()) out.cols.push_back(copyStripIdent(cur));
+        }
+    }
+    skipws();
+    if (strncasecmp(p, "FROM", 4) == 0) { out.is_from = true; p += 4; }
+    else if (strncasecmp(p, "TO", 2) == 0) { out.is_from = false; p += 2; }
+    else return false;
+    skipws();
+    if (out.is_from) { if (strncasecmp(p, "STDIN", 5) != 0) return false; p += 5; }
+    else { if (strncasecmp(p, "STDOUT", 6) != 0) return false; p += 6; }
+    if (out.is_query && out.is_from) return false;  // COPY (query) FROM is invalid
+
+    // Remainder = options (strip trailing ';').
+    std::string optText(p);
+    while (!optText.empty() && (optText.back() == ';' || optText.back() == ' ' ||
+           optText.back() == '\t' || optText.back() == '\n' || optText.back() == '\r'))
+        optText.pop_back();
+    copyParseOptions(optText, out.opts);
+    out.valid = true;
+    return true;
+}
+
+// Parse the accumulated COPY-FROM payload into rows of fields.
+static std::vector<std::vector<CopyField>> copyParseData(const std::string& data,
+                                                         const CopyOpts& o) {
+    std::vector<std::vector<CopyField>> rows;
+    size_t i = 0, n = data.size();
+    if (o.csv) {
+        std::vector<CopyField> row;
+        std::string cur; bool quoted = false, in_quotes = false, field_started = false;
+        auto endField = [&]() {
+            CopyField f;
+            if (!quoted && cur == o.null_str) { f.is_null = true; }
+            else { f.is_null = false; f.val = cur; }
+            row.push_back(f);
+            cur.clear(); quoted = false; field_started = false;
+        };
+        auto endRow = [&]() { endField(); rows.push_back(row); row.clear(); };
+        while (i < n) {
+            // psql sends the "\." end-of-data marker line even in CSV mode.
+            if (!in_quotes && !field_started && row.empty() && cur.empty() &&
+                data[i] == '\\' && i + 1 < n && data[i + 1] == '.' &&
+                (i + 2 >= n || data[i + 2] == '\n' || data[i + 2] == '\r')) {
+                break;
+            }
+            char c = data[i];
+            if (in_quotes) {
+                if (c == '"') {
+                    if (i + 1 < n && data[i + 1] == '"') { cur += '"'; i += 2; continue; }
+                    in_quotes = false; i++;
+                } else { cur += c; i++; }
+            } else {
+                if (c == '"') { in_quotes = true; quoted = true; field_started = true; i++; }
+                else if (c == o.delim) { endField(); i++; }
+                else if (c == '\n') {
+                    // Real row only if something was started; skip blank lines
+                    // (including the trailing newline after the last row).
+                    if (field_started || !row.empty()) endRow();
+                    i++;
+                }
+                else if (c == '\r') { i++; }  // tolerate CRLF
+                else { cur += c; field_started = true; i++; }
+            }
+        }
+        if (field_started || !row.empty()) endRow();
+    } else {
+        // Text format: split on newlines, then on the delimiter, then unescape.
+        while (i < n) {
+            size_t eol = data.find('\n', i);
+            std::string line = (eol == std::string::npos) ? data.substr(i) : data.substr(i, eol - i);
+            i = (eol == std::string::npos) ? n : eol + 1;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line == "\\.") break;        // end-of-data marker
+            if (line.empty()) continue;      // skip blank lines / trailing newline
+            std::vector<CopyField> row;
+            std::string raw;
+            std::vector<std::string> fields;
+            for (size_t j = 0; j <= line.size(); j++) {
+                if (j == line.size() || line[j] == o.delim) { fields.push_back(raw); raw.clear(); }
+                else raw += line[j];
+            }
+            for (auto& f : fields) {
+                CopyField cf;
+                if (f == o.null_str) { cf.is_null = true; row.push_back(cf); continue; }
+                std::string v;
+                for (size_t j = 0; j < f.size(); j++) {
+                    if (f[j] == '\\' && j + 1 < f.size()) {
+                        char e = f[++j];
+                        switch (e) {
+                            case 'n': v += '\n'; break;
+                            case 't': v += '\t'; break;
+                            case 'r': v += '\r'; break;
+                            case '\\': v += '\\'; break;
+                            default: v += e; break;
+                        }
+                    } else v += f[j];
+                }
+                cf.is_null = false; cf.val = v; row.push_back(cf);
+            }
+            rows.push_back(row);
+        }
+    }
+    return rows;
+}
+
+static int copyTableColumnCount(sqlite3* db, const std::string& table) {
+    std::string q = "SELECT count(*) FROM pragma_table_info(" +
+                    sqlQuoteLiteral(table) + ")";
+    sqlite3_stmt* s = nullptr; int n = 0;
+    if (sqlite3_prepare_v2(db, q.c_str(), -1, &s, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int(s, 0);
+        sqlite3_finalize(s);
+    }
+    return n;
+}
+
+static void copyToStdout(int fd, sqlite3* db, const CopyStmt& cs) {
+    std::string sql;
+    if (cs.is_query) {
+        sql = cs.target;
+    } else {
+        sql = "SELECT ";
+        if (cs.cols.empty()) sql += "*";
+        else {
+            for (size_t i = 0; i < cs.cols.size(); i++) {
+                if (i) sql += ", ";
+                sql += "\"" + cs.cols[i] + "\"";
+            }
+        }
+        sql += " FROM " + cs.target;
+    }
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+        sendErrorResponse(fd, "ERROR", "42000", sqlite3_errmsg(db));
+        sendReadyForQuery(fd, 'I');
+        return;
+    }
+    int ncols = sqlite3_column_count(st);
+    { PgMsg m; m.putByte(0); m.putInt16((int16_t)ncols);
+      for (int i = 0; i < ncols; i++) m.putInt16(0); m.send(fd, 'H'); }  // CopyOutResponse
+
+    const CopyOpts& o = cs.opts;
+    if (o.header) {
+        std::string line;
+        for (int i = 0; i < ncols; i++) {
+            if (i) line += o.delim;
+            const char* nm = sqlite3_column_name(st, i);
+            copyAppendField(line, nm ? nm : "", nm ? (int)strlen(nm) : 0, o);
+        }
+        line += '\n';
+        PgMsg m; m.putBytes(line.data(), line.size()); m.send(fd, 'd');
+    }
+
+    int64_t nrows = 0; int rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        std::string line;
+        for (int i = 0; i < ncols; i++) {
+            if (i) line += o.delim;
+            if (sqlite3_column_type(st, i) == SQLITE_NULL) line += o.null_str;
+            else {
+                const char* v = (const char*)sqlite3_column_text(st, i);
+                int len = sqlite3_column_bytes(st, i);
+                copyAppendField(line, v ? v : "", len, o);
+            }
+        }
+        line += '\n';
+        PgMsg m; m.putBytes(line.data(), line.size());
+        if (!m.send(fd, 'd')) { sqlite3_finalize(st); return; }
+        nrows++;
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        // Error mid-scan: PG would send ErrorResponse; we already streamed data,
+        // so just report and let the client see the failure.
+        sendErrorResponse(fd, "ERROR", "XX000", sqlite3_errmsg(db));
+        sendReadyForQuery(fd, 'I');
+        return;
+    }
+    { PgMsg m; m.send(fd, 'c'); }  // CopyDone
+    char tag[64]; snprintf(tag, sizeof(tag), "COPY %lld", (long long)nrows);
+    sendCommandComplete(fd, tag);
+    sendReadyForQuery(fd, 'I');
+}
+
+static void copyFromStdin(int fd, sqlite3* db, const CopyStmt& cs) {
+    int ncols = (int)cs.cols.size();
+    if (ncols == 0) {
+        ncols = copyTableColumnCount(db, cs.table_name);
+        if (ncols <= 0) {
+            sendErrorResponse(fd, "ERROR", "42P01",
+                              "COPY: cannot determine target columns");
+            sendReadyForQuery(fd, 'I');
+            return;
+        }
+    }
+    std::string ins = "INSERT INTO " + cs.target + " ";
+    if (!cs.cols.empty()) {
+        ins += "(";
+        for (size_t i = 0; i < cs.cols.size(); i++) {
+            if (i) ins += ", ";
+            ins += "\"" + cs.cols[i] + "\"";
+        }
+        ins += ") ";
+    }
+    ins += "VALUES (";
+    for (int i = 0; i < ncols; i++) ins += (i ? ",?" : "?");
+    ins += ")";
+
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db, ins.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+        sendErrorResponse(fd, "ERROR", "42000", sqlite3_errmsg(db));
+        sendReadyForQuery(fd, 'I');
+        return;
+    }
+
+    // CopyInResponse, then stream client CopyData until CopyDone/CopyFail.
+    { PgMsg m; m.putByte(0); m.putInt16((int16_t)ncols);
+      for (int i = 0; i < ncols; i++) m.putInt16(0); m.send(fd, 'G'); }
+
+    std::string data; bool failed = false; std::string failMsg;
+    while (true) {
+        uint8_t t; if (!readFull(fd, &t, 1)) { failed = true; failMsg = "connection lost"; break; }
+        int32_t blen = readInt32(fd);
+        if (blen < 4) { failed = true; failMsg = "bad message length"; break; }
+        int32_t plen = blen - 4;
+        std::vector<char> pl(plen > 0 ? plen : 1);
+        if (plen > 0 && !readFull(fd, pl.data(), plen)) { failed = true; failMsg = "connection lost"; break; }
+        if (t == 'd') data.append(pl.data(), plen);
+        else if (t == 'c') break;                       // CopyDone
+        else if (t == 'f') { failed = true; failMsg.assign(pl.data(), plen > 0 ? plen - 1 : 0); break; }
+        else if (t == 'H' || t == 'S') { /* Flush/Sync mid-copy: ignore */ }
+        else { failed = true; failMsg = "unexpected message during COPY"; break; }
+    }
+    if (failed) {
+        sqlite3_finalize(st);
+        sendErrorResponse(fd, "ERROR", "57014",
+                          failMsg.empty() ? "COPY from stdin failed" : failMsg.c_str());
+        sendReadyForQuery(fd, 'I');
+        return;
+    }
+
+    std::vector<std::vector<CopyField>> rows = copyParseData(data, cs.opts);
+    size_t startRow = (cs.opts.header && !rows.empty()) ? 1 : 0;
+
+    sqlite3_exec(db, "BEGIN", nullptr, nullptr, nullptr);
+    int64_t nrows = 0; bool ok = true; std::string err;
+    for (size_t ri = startRow; ri < rows.size(); ri++) {
+        auto& row = rows[ri];
+        if ((int)row.size() != ncols) {
+            ok = false; err = "COPY row has wrong number of columns"; break;
+        }
+        sqlite3_reset(st);
+        sqlite3_clear_bindings(st);
+        for (int c = 0; c < ncols; c++) {
+            if (row[c].is_null) sqlite3_bind_null(st, c + 1);
+            else sqlite3_bind_text(st, c + 1, row[c].val.c_str(),
+                                   (int)row[c].val.size(), SQLITE_TRANSIENT);
+        }
+        if (sqlite3_step(st) != SQLITE_DONE) { ok = false; err = sqlite3_errmsg(db); break; }
+        nrows++;
+    }
+    sqlite3_finalize(st);
+    sqlite3_exec(db, ok ? "COMMIT" : "ROLLBACK", nullptr, nullptr, nullptr);
+
+    if (!ok) {
+        sendErrorResponse(fd, "ERROR", "XX000", err.c_str());
+        sendReadyForQuery(fd, 'I');
+        return;
+    }
+    char tag[64]; snprintf(tag, sizeof(tag), "COPY %lld", (long long)nrows);
+    sendCommandComplete(fd, tag);
+    sendReadyForQuery(fd, 'I');
+}
+
+// Returns true if `sql` was a COPY statement and has been fully handled
+// (including the trailing ReadyForQuery).
+static bool tryHandleCopy(int fd, sqlite3* db, const char* p) {
+    if (strncasecmp(p, "COPY", 4) != 0 ||
+        !(p[4] == ' ' || p[4] == '\t' || p[4] == '\n')) {
+        return false;
+    }
+    CopyStmt cs;
+    if (!copyParseStmt(p, cs) || !cs.valid) {
+        sendErrorResponse(fd, "ERROR", "42601", "could not parse COPY statement");
+        sendReadyForQuery(fd, 'I');
+        return true;
+    }
+    if (cs.is_from) copyFromStdin(fd, db, cs);
+    else copyToStdout(fd, db, cs);
+    return true;
+}
+
 static void handleQuery(int fd, sqlite3* db, const char* sql) {
     // Skip empty queries
     const char* p = sql;
@@ -431,6 +899,9 @@ static void handleQuery(int fd, sqlite3* db, const char* sql) {
         sendReadyForQuery(fd, 'I');
         return;
     }
+
+    // COPY ... TO STDOUT / FROM STDIN (handles its own protocol + ReadyForQuery).
+    if (tryHandleCopy(fd, db, p)) return;
 
     // Rewrite PG-specific syntax (~, !~, ::regclass, etc.) to SQLite-compatible
     std::string rewritten = oroPgRewriteQuery(sql);
