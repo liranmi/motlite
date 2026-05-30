@@ -5,7 +5,7 @@
  * The MassTree primary index uses rowid (big-endian uint64) as the key.
  *
  * Internal MOT table layout (per SQLite MOT table):
- *   col 0: data    (BLOB, max 16KB) - the SQLite serialized record bytes
+ *   col 0: data    (BLOB, up to MAX_RECORD_SIZE) - SQLite serialized record bytes
  *   col 1: rowid   (LONG)            - the rowid (also InternalKey)
  */
 
@@ -45,8 +45,18 @@ using namespace MOT;
 // Constants
 // =====================================================================
 
-// Max size for the SQLite record blob stored in MOT
-static constexpr uint32_t MAX_RECORD_SIZE = 4096;
+// Max size for the SQLite record blob stored in MOT.
+//
+// Hard ceiling: MOT enforces MAX_TUPLE_SIZE = 16384 bytes for the *entire*
+// row (sum of all column sizes; see oro-db global.h). The secondary-index
+// table is the tightest consumer — its tuple is
+//   idx_rowid(8) + idx_record(MAX_RECORD_SIZE) + idx_key(IDX_KEY_COL_SIZE=256)
+// plus MOT's null-byte bitmap. So MAX_RECORD_SIZE must stay below
+//   16384 - 8 - 256 - (bitmap/overhead) ≈ 16100.
+// We pick 15360 (15 KB) to leave comfortable headroom while giving ~3.75x the
+// old 4 KB limit. Records larger than this are rejected with an explicit
+// error (see oroMotInsert) rather than failing silently.
+static constexpr uint32_t MAX_RECORD_SIZE = 15360;
 
 // Key length for the primary index (8 bytes uint64)
 static constexpr uint16_t MOT_KEY_LEN = 8;
@@ -192,6 +202,12 @@ struct OroMotCursor {
     // PendingNextAfter(conn, table, pending_last, ...) gives the next one.
     bool             pending_mode = false;
     int64_t          pending_last = INT64_MIN;
+    // --- Reverse iteration ---
+    // True when `iter` is a MOT reverse iterator (its Next() walks toward
+    // smaller keys). Set by oroMotLast and the LT/LE seek branches; consumed by
+    // oroMotPrev and by CursorAdvance (which must not fall through to the
+    // forward pending-inserts overlay while iterating backward).
+    bool             reverse      = false;
 };
 
 // =====================================================================
@@ -641,7 +657,14 @@ static void CursorAdvance(OroMotCursor* cur) {
             }
             cur->iter->Next();
         }
-        // Regular iter exhausted — switch into pending-overlay mode.
+        // Regular iter exhausted. The pending-inserts overlay is a forward,
+        // ascending-rowid structure, so it only makes sense for forward scans;
+        // when iterating backward we simply stop at EOF.
+        if (cur->reverse) {
+            cur->at_eof = true;
+            return;
+        }
+        // Switch into pending-overlay mode.
         cur->pending_mode = true;
         cur->pending_last = INT64_MIN;
     }
@@ -667,6 +690,7 @@ extern "C" int oroMotFirst(OroMotCursor* pCur, int* pEof) {
         pCur->iter = nullptr;
     }
     pCur->iter = pCur->index->Begin(0);
+    pCur->reverse = false;
     pCur->pending_mode = false;
     pCur->pending_last = INT64_MIN;
     if (pCur->is_index) {
@@ -678,9 +702,36 @@ extern "C" int oroMotFirst(OroMotCursor* pCur, int* pEof) {
     return 0;
 }
 
+// Position at the last (largest-key) visible entry and set the cursor up for
+// backward iteration via oroMotPrev. Used by OP_Last — e.g. the SELECT max(col)
+// optimization and ORDER BY col DESC over an index. MOT's ReverseBegin returns
+// an iterator whose Next() walks toward smaller keys.
 extern "C" int oroMotLast(OroMotCursor* pCur, int* pEof) {
-    // Simple implementation: not used for primary scan, can be added later
-    *pEof = 1;
+    EnsureThreadCtx(pCur->conn);
+    if (pCur->iter) {
+        pCur->iter->Destroy();
+        pCur->iter = nullptr;
+    }
+    // MassTree's ReverseBegin is unimplemented (returns nullptr) in this build,
+    // so position the reverse iterator with a search key that sorts above every
+    // stored key (all 0xFF). A reverse Search then lands on the last (largest)
+    // entry, and its Next() walks backward from there.
+    Key* key = pCur->index->CreateNewSearchKey();
+    if (!key) { pCur->at_eof = true; *pEof = 1; return 0; }
+    key->FillPattern(0xFF, key->GetKeyLength(), 0);
+    bool found = false;
+    pCur->iter = pCur->index->Search(key, false /*matchKey*/, false /*reverse*/,
+                                     0 /*pid*/, found);
+    pCur->index->DestroyKey(key);
+    pCur->reverse = true;
+    pCur->pending_mode = false;
+    pCur->pending_last = INT64_MIN;
+    if (pCur->is_index) {
+        IdxCursorAdvance(pCur);
+    } else {
+        CursorAdvance(pCur);
+    }
+    *pEof = pCur->at_eof ? 1 : 0;
     return 0;
 }
 
@@ -705,13 +756,27 @@ extern "C" int oroMotNext(OroMotCursor* pCur, int* pEof) {
     return 0;
 }
 
+// Step the cursor backward. Valid only when the cursor holds a reverse iterator
+// (established by oroMotLast or an LT/LE seek): the underlying iterator's Next()
+// advances toward smaller keys, so this mirrors oroMotNext.
 extern "C" int oroMotPrev(OroMotCursor* pCur, int* pEof) {
-    *pEof = 1;
+    if (pCur->iter && pCur->reverse) {
+        pCur->iter->Next();  // reverse iterator → moves to the previous key
+        if (pCur->is_index) {
+            IdxCursorAdvance(pCur);
+        } else {
+            CursorAdvance(pCur);
+        }
+    } else {
+        pCur->at_eof = true;
+    }
+    *pEof = pCur->at_eof ? 1 : 0;
     return 0;
 }
 
 extern "C" int oroMotSeekRowid(OroMotCursor* pCur, int64_t rowid, int* pRes) {
     EnsureThreadCtx(pCur->conn);
+    pCur->reverse = false;
 
     if (pCur->iter) {
         pCur->iter->Destroy();
@@ -761,30 +826,38 @@ extern "C" int oroMotSeekCmp(OroMotCursor* pCur, int64_t rowid, int cmp_op,
         pCur->iter = nullptr;
     }
 
-    /* For GT/GE scans: start at beginning, advance until condition met.
-     * For LT/LE scans: start at beginning, advance while rowid < target, keep last match.
-     * This is O(N) but correct. MOT could optimize with range-aware iterators later. */
-    pCur->iter = pCur->index->Begin(0);
-    CursorAdvance(pCur);
-
-    while (!pCur->at_eof) {
-        int64_t cur = pCur->current_rowid;
-        bool match = false;
-        switch (cmp_op) {
-            case 0: match = (cur >  rowid); break;  // GT
-            case 1: match = (cur >= rowid); break;  // GE
-            case 2: match = (cur <  rowid); break;  // LT
-            case 3: match = (cur <= rowid); break;  // LE
-        }
-        if (match) break;
-
-        /* For GT/GE: if current key < target, advance */
-        if (cmp_op <= 1) {
+    if (cmp_op <= 1) {
+        /* GT/GE: forward scan from the start until the bound is satisfied,
+         * leaving the forward iterator positioned for OP_Next. */
+        pCur->reverse = false;
+        pCur->iter = pCur->index->Begin(0);
+        CursorAdvance(pCur);
+        while (!pCur->at_eof) {
+            int64_t cur = pCur->current_rowid;
+            bool match = (cmp_op == 0) ? (cur > rowid) : (cur >= rowid);
+            if (match) break;
             if (pCur->iter) pCur->iter->Next();
             CursorAdvance(pCur);
-        } else {
-            /* For LT/LE scans, SQLite uses iteration in reverse. Full support
-             * would need a reverse iterator. For now, scan past non-matching. */
+        }
+    } else {
+        /* LT/LE: position at the largest rowid <= target with a reverse
+         * iterator (O(log N)) and leave it positioned so OP_Prev can continue
+         * the backward scan. */
+        pCur->reverse = true;
+        Key* key = pCur->index->CreateNewSearchKey();
+        if (!key) { pCur->at_eof = true; *pEof = 1; return 0; }
+        key->FillPattern(0x00, key->GetKeyLength(), 0);
+        uint64_t be_val = htobe64((uint64_t)rowid);
+        key->FillValue(reinterpret_cast<const uint8_t*>(&be_val), sizeof(uint64_t), 0);
+        bool found = false;
+        pCur->iter = pCur->index->Search(key, true /*matchKey*/,
+                                         false /*reverse*/, 0, found);
+        pCur->index->DestroyKey(key);
+        CursorAdvance(pCur);
+        /* Skip any entries that overshoot the bound (defensive against
+         * boundary positioning): LT excludes the target, LE includes it. */
+        int64_t limit = (cmp_op == 2) ? rowid : rowid + 1;  // strict upper bound
+        while (!pCur->at_eof && pCur->current_rowid >= limit) {
             if (pCur->iter) pCur->iter->Next();
             CursorAdvance(pCur);
         }
@@ -1739,57 +1812,57 @@ extern "C" int oroMotIdxSeek(OroMotCursor* pCur,
     int copyLen = nKey < (int)IDX_ENC_KEY_LEN ? nKey : (int)IDX_ENC_KEY_LEN;
     key->FillValue((const uint8_t*)pEncodedKey, copyLen, sizeof(uint32_t));
 
-    bool found = false;
-    bool forward = (cmp_op <= 1);  // GT,GE = forward; LT,LE = reverse?
+    // Stored index keys carry a full 252-byte encoded key (the indexed value
+    // followed by a per-row suffix). The search value only fills `copyLen`
+    // bytes, leaving the rest zero. For an inclusive upper bound (LE) the
+    // reverse search must sort at or above every entry that shares this value,
+    // so pad the suffix with 0xFF. LT keeps the zero padding so it sorts below
+    // equal-valued entries and the reverse search excludes them.
+    if (cmp_op == 3 && copyLen < (int)IDX_ENC_KEY_LEN) {
+        key->FillPattern(0xFF, IDX_ENC_KEY_LEN - copyLen,
+                         sizeof(uint32_t) + copyLen);
+    }
 
-    // For GE/GT: search forward from the key position
-    // For LE/LT: search forward too but we'll need to handle differently
-    pCur->iter = pCur->index->Search(key, true /*matchKey*/, true /*forward*/,
-                                     0 /*pid*/, found);
-    pCur->index->DestroyKey(key);
+    bool found = false;
 
     if (cmp_op == 0 || cmp_op == 1) {
-        // GE or GT
+        // GE/GT: forward iterator positioned at the first entry >= key, left
+        // in place for OP_Next to continue the ascending scan.
+        pCur->reverse = false;
+        pCur->iter = pCur->index->Search(key, true /*matchKey*/, true /*forward*/,
+                                         0 /*pid*/, found);
+        pCur->index->DestroyKey(key);
         IdxCursorAdvance(pCur);
         if (cmp_op == 0 && !pCur->at_eof) {
-            // GT: if positioned at exact match, skip it
-            // Compare current key against search key
+            // GT: if positioned at exact match, skip it.
             Column* col = pCur->table->GetField(IDX_COL_KEY);
             const uint8_t* curKey = pCur->current_row->GetData() + col->m_offset + sizeof(uint32_t);
             if (memcmp(curKey, pEncodedKey, copyLen) == 0) {
-                // Exact match — need to advance past it for GT
                 if (pCur->iter) pCur->iter->Next();
                 IdxCursorAdvance(pCur);
             }
         }
     } else {
-        // LT or LE: we need entries before the key.
-        // MassTree Search positions at or after the key.
-        // We need to back up. For now, scan from beginning and stop at key.
-        if (pCur->iter) { pCur->iter->Destroy(); pCur->iter = nullptr; }
-        pCur->iter = pCur->index->Begin(0);
-        // Find the last entry that is < (or <=) the search key
-        OroMotCursor best = {};
-        best.at_eof = true;
-        while (true) {
-            IdxCursorAdvance(pCur);
-            if (pCur->at_eof) break;
+        // LT/LE: reverse iterator positioned at the largest entry <= key
+        // (O(log N) instead of a full forward scan), left in place so OP_Prev
+        // continues the descending scan. The reverse iterator's Next() walks
+        // toward smaller keys.
+        pCur->reverse = true;
+        pCur->iter = pCur->index->Search(key, true /*matchKey*/, false /*reverse*/,
+                                         0 /*pid*/, found);
+        pCur->index->DestroyKey(key);
+        IdxCursorAdvance(pCur);
+        if (cmp_op == 2) {
+            // LT: skip entries equal to the key (a non-unique index may hold
+            // several rowids under the same key).
             Column* col = pCur->table->GetField(IDX_COL_KEY);
-            const uint8_t* curKey = pCur->current_row->GetData() + col->m_offset + sizeof(uint32_t);
-            int cmp = memcmp(curKey, pEncodedKey, copyLen);
-            if (cmp_op == 2 && cmp >= 0) break;   // LT: stop at >=
-            if (cmp_op == 3 && cmp > 0) break;    // LE: stop at >
-            best.current_row = pCur->current_row;
-            best.idx_rowid = pCur->idx_rowid;
-            best.at_eof = false;
-            if (pCur->iter) pCur->iter->Next();
-        }
-        if (!best.at_eof) {
-            pCur->current_row = best.current_row;
-            pCur->idx_rowid = best.idx_rowid;
-            pCur->at_eof = false;
-        } else {
-            pCur->at_eof = true;
+            while (!pCur->at_eof) {
+                const uint8_t* curKey =
+                    pCur->current_row->GetData() + col->m_offset + sizeof(uint32_t);
+                if (memcmp(curKey, pEncodedKey, copyLen) != 0) break;
+                if (pCur->iter) pCur->iter->Next();
+                IdxCursorAdvance(pCur);
+            }
         }
     }
 
@@ -1926,6 +1999,67 @@ extern "C" int oroMotWalIsEnabled(void* pDb) {
     return it->second->wal_enabled ? 1 : 0;
 }
 
+// After WAL replay restores the primary MOT tables, repopulate every
+// registered secondary index from the now-recovered rows.
+//
+// Why this is needed (GAPS.md #11, cross-restart): on reopen, schema load
+// re-runs CREATE INDEX, which registers the index in g.sec_indexes and calls
+// oroMotIndexBackfill — but at that point the primary MOT table is still empty
+// (recovery hasn't run yet), so the index is born empty. WAL replay only
+// re-applies primary-table INSERT/DELETE; it never touches secondary indexes.
+// Re-running the existing backfill here (after the primary tables are full)
+// closes the gap. Backfill is idempotent, so this is safe even if some entries
+// already exist.
+static void RecoverSecondaryIndexes(sqlite3* db, OroMotConn* c) {
+    // Snapshot the registered (table, index) identities for the main db so we
+    // don't hold g.mu across SQLite/MOT calls.
+    std::vector<std::pair<std::string, std::string>> idxs;
+    {
+        auto& g = globals();
+        std::lock_guard<std::mutex> lock(g.mu);
+        for (auto& kv : g.sec_indexes) {
+            if (kv.first.iDb == 0) {
+                idxs.emplace_back(kv.first.tabName, kv.first.ixName);
+            }
+        }
+    }
+
+    for (auto& ti : idxs) {
+        // Recover the indexed column names from the loaded schema. PRAGMA
+        // index_info is safe here — unlike the CREATE INDEX codegen path, we
+        // run at a normal statement boundary with the schema fully parsed.
+        std::vector<std::string> cols;
+        char* zPragma = sqlite3_mprintf("PRAGMA index_info(%Q)", ti.second.c_str());
+        if (!zPragma) continue;
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(db, zPragma, -1, &st, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                const char* cn = (const char*)sqlite3_column_text(st, 2); // name
+                if (cn) cols.emplace_back(cn);
+            }
+        }
+        sqlite3_finalize(st);
+        sqlite3_free(zPragma);
+        if (cols.empty()) continue;
+
+        std::vector<const char*> cptrs;
+        cptrs.reserve(cols.size());
+        for (auto& s : cols) cptrs.push_back(s.c_str());
+
+        oroMotIndexBackfill(db, 0, ti.first.c_str(), ti.second.c_str(),
+                            cptrs.data(), (int)cptrs.size());
+
+        // oroMotIndexBackfill opens an index cursor which starts a MOT txn but
+        // does not commit it (in the live path the surrounding VDBE Halt does).
+        // Commit the staged index inserts here.
+        if (c->in_txn) {
+            c->txn->Commit();
+            c->txn->EndTransaction();
+            c->in_txn = false;
+        }
+    }
+}
+
 extern "C" int oroMotWalRecover(void* pDb) {
     if (!pDb) return -1;
     sqlite3* db = (sqlite3*)pDb;
@@ -2008,6 +2142,10 @@ extern "C" int oroMotWalRecover(void* pDb) {
     sqlite3_finalize(sel);
 
     c->wal_replaying = false;
+
+    // Primary tables are now restored; rebuild secondary indexes from them
+    // (they were created empty during schema load, before this replay).
+    RecoverSecondaryIndexes(db, c);
 
     // Keep _mot_wal intact. Replays are idempotent (UNIQUE violations and
     // missing-delete rows are both treated as already-applied), so every

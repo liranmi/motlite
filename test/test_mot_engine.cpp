@@ -341,6 +341,82 @@ static void TestDataTypes() {
     TEST_ASSERT(r.rows[0][3] == "DEADBEEF", "blob hex");
 }
 
+// --- Large records (GAPS.md #12) ---
+//
+// MOT caps the whole tuple at MAX_TUPLE_SIZE (16384). The adapter's
+// MAX_RECORD_SIZE was raised from 4096 to 15360, so records up to ~15 KB now
+// round-trip; anything larger must be rejected with an error (not dropped
+// silently).
+static void TestLargeRecord() {
+    SetupDb();
+    auto r = ExecSql(g_db,
+        "CREATE MOT TABLE t_big (id INTEGER PRIMARY KEY, body TEXT)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create");
+
+    // A ~14 KB record: comfortably above the old 4 KB ceiling, below the new
+    // 15 KB one. The serialized record is body length plus a few header bytes.
+    std::string body(14000, 'a');
+    std::string ins = "INSERT INTO t_big VALUES(1, '" + body + "')";
+    r = ExecSql(g_db, ins.c_str());
+    TEST_ASSERT(r.rc == SQLITE_OK, "insert 14KB record");
+
+    r = ExecSql(g_db, "SELECT length(body) FROM t_big WHERE id = 1");
+    TEST_ASSERT(r.rows.size() == 1, "row present");
+    TEST_ASSERT(r.rows[0][0] == "14000", "14KB body length preserved");
+
+    // Over the limit: a ~20 KB record exceeds MAX_RECORD_SIZE and must error
+    // rather than silently vanish.
+    std::string huge(20000, 'b');
+    std::string ins2 = "INSERT INTO t_big VALUES(2, '" + huge + "')";
+    r = ExecSql(g_db, ins2.c_str());
+    TEST_ASSERT(r.rc != SQLITE_OK, "oversize record is rejected with an error");
+
+    // The failed insert left no trace.
+    r = ExecSql(g_db, "SELECT count(*) FROM t_big");
+    TEST_ASSERT(r.rows[0][0] == "1", "only the valid row remains");
+}
+
+// --- Views over MOT tables (GAPS.md #15) ---
+//
+// View resolution happens above the cursor layer, so a native SQLite view
+// over a MOT table (and a view that joins MOT + native tables) should work.
+// This test verifies that previously-unverified gap.
+static void TestViewOnMot() {
+    SetupDb();
+    auto r = ExecSql(g_db,
+        "CREATE MOT TABLE v_sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create mot table");
+    ExecSql(g_db, "INSERT INTO v_sales VALUES(1,'east',100),(2,'west',200),"
+                  "(3,'east',50),(4,'west',75)");
+
+    // Simple view over a MOT table.
+    r = ExecSql(g_db,
+        "CREATE VIEW v_east AS SELECT id, amount FROM v_sales WHERE region='east'");
+    TEST_ASSERT(r.rc == SQLITE_OK, r.errmsg.c_str());
+    r = ExecSql(g_db, "SELECT count(*), sum(amount) FROM v_east");
+    TEST_ASSERT(r.rows[0][0] == "2", "view row count");
+    TEST_ASSERT(r.rows[0][1] == "150", "view sum");
+
+    // Aggregating view with GROUP BY.
+    r = ExecSql(g_db,
+        "CREATE VIEW v_by_region AS "
+        "SELECT region, sum(amount) AS total FROM v_sales GROUP BY region");
+    TEST_ASSERT(r.rc == SQLITE_OK, r.errmsg.c_str());
+    r = ExecSql(g_db, "SELECT total FROM v_by_region WHERE region='west'");
+    TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "275", "grouped view total");
+
+    // View joining a MOT table with a native table.
+    ExecSql(g_db, "CREATE TABLE v_region_info (region TEXT PRIMARY KEY, mgr TEXT)");
+    ExecSql(g_db, "INSERT INTO v_region_info VALUES('east','Ann'),('west','Bob')");
+    r = ExecSql(g_db,
+        "CREATE VIEW v_joined AS "
+        "SELECT s.id, i.mgr FROM v_sales s JOIN v_region_info i ON s.region=i.region");
+    TEST_ASSERT(r.rc == SQLITE_OK, r.errmsg.c_str());
+    r = ExecSql(g_db, "SELECT mgr FROM v_joined WHERE id=2");
+    TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "Bob",
+                "cross-engine view join");
+}
+
 // --- Both engines coexist ---
 
 static void TestDualEngine() {
@@ -474,6 +550,72 @@ static void TestCreateIndexBackfill() {
     r = ExecSql(g_db, "SELECT id FROM t_bf WHERE v = 2010");
     TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "201",
                 "post-CREATE INDEX insert is indexed");
+}
+
+// --- Reverse iteration (GAPS.md #8 / OP_Last & OP_Prev) ---
+//
+// Before this was wired, SELECT max(indexed_col), ORDER BY col DESC, and
+// reverse range scans hit the unwired OP_Last/OP_Prev path and crashed
+// (OP_Last/OP_Prev asserted CURTYPE_BTREE). This verifies the MOT reverse
+// iterator end to end, including the inclusive LE upper bound and non-unique
+// indexes (multiple rowids per key).
+static void TestReverseIteration() {
+    SetupDb();
+    auto r = ExecSql(g_db,
+        "CREATE MOT TABLE t_rev (id INTEGER PRIMARY KEY, v INTEGER)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create");
+    for (int i = 1; i <= 50; i++) {
+        char sql[96];
+        snprintf(sql, sizeof(sql), "INSERT INTO t_rev VALUES(%d, %d)", i, i * 10);
+        ExecSql(g_db, sql);
+    }
+    r = ExecSql(g_db, "CREATE INDEX t_rev_v ON t_rev(v)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create index");
+
+    // max() — uses OP_Last on the index (this used to segfault).
+    r = ExecSql(g_db, "SELECT max(v) FROM t_rev");
+    TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "500", "max(v)=500");
+    // min() — forward scan, sanity.
+    r = ExecSql(g_db, "SELECT min(v) FROM t_rev");
+    TEST_ASSERT(r.rows[0][0] == "10", "min(v)=10");
+
+    // ORDER BY v DESC via the index — reverse full scan.
+    r = ExecSql(g_db, "SELECT v FROM t_rev ORDER BY v DESC");
+    TEST_ASSERT(r.rows.size() == 50, "50 rows desc");
+    TEST_ASSERT(r.rows[0][0] == "500", "first desc = 500");
+    TEST_ASSERT(r.rows[1][0] == "490", "second desc = 490");
+    TEST_ASSERT(r.rows[49][0] == "10", "last desc = 10");
+
+    // Inclusive upper bound (LE) descending — must include the boundary 300.
+    r = ExecSql(g_db, "SELECT v FROM t_rev WHERE v <= 300 ORDER BY v DESC");
+    TEST_ASSERT(r.rows.size() == 30, "30 rows <= 300");
+    TEST_ASSERT(r.rows[0][0] == "300", "LE includes boundary 300");
+    TEST_ASSERT(r.rows[1][0] == "290", "next is 290");
+
+    // Exclusive upper bound (LT) descending — must exclude 300.
+    r = ExecSql(g_db, "SELECT v FROM t_rev WHERE v < 300 ORDER BY v DESC");
+    TEST_ASSERT(r.rows.size() == 29, "29 rows < 300");
+    TEST_ASSERT(r.rows[0][0] == "290", "LT excludes boundary, first = 290");
+
+    // Bounded reverse range.
+    r = ExecSql(g_db,
+        "SELECT v FROM t_rev WHERE v >= 100 AND v <= 200 ORDER BY v DESC");
+    TEST_ASSERT(r.rows.size() == 11, "11 rows in [100,200]");
+    TEST_ASSERT(r.rows[0][0] == "200" && r.rows[10][0] == "100",
+                "reverse range bounds");
+
+    // Non-unique index: several rowids share a key. max/LE must see them all.
+    r = ExecSql(g_db,
+        "CREATE MOT TABLE t_dup (id INTEGER PRIMARY KEY, g INTEGER)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create dup");
+    ExecSql(g_db, "CREATE INDEX t_dup_g ON t_dup(g)");
+    ExecSql(g_db, "INSERT INTO t_dup VALUES(1,5),(2,5),(3,5),(4,9),(5,9),(6,1)");
+    r = ExecSql(g_db, "SELECT max(g) FROM t_dup");
+    TEST_ASSERT(r.rows[0][0] == "9", "dup max=9");
+    r = ExecSql(g_db, "SELECT count(*) FROM t_dup WHERE g <= 5");
+    TEST_ASSERT(r.rows[0][0] == "4", "dup LE 5 counts 4 (three 5s + one 1)");
+    r = ExecSql(g_db, "SELECT count(*) FROM t_dup WHERE g < 5");
+    TEST_ASSERT(r.rows[0][0] == "1", "dup LT 5 counts 1 (the single 1)");
 }
 
 // --- Rowid allocation after DELETEs ---
@@ -758,6 +900,66 @@ static void TestWalDeletes() {
     unlink(path.c_str());
 }
 
+// --- Cross-restart secondary index recovery (GAPS.md #11, remaining) ---
+//
+// A secondary index created in one session must still return rows after the
+// process restarts. WAL replay restores the primary table; RecoverSecondaryIndexes
+// must then rebuild the index. INDEXED BY forces the index path so an empty
+// index can't be masked by a full-table scan.
+static void TestWalSecondaryIndexRecovery() {
+    std::string path = TempDbPath("secidx");
+
+    // Session 1: create table, populate, build index, close.
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        TEST_ASSERT(db != nullptr, "open 1");
+        auto r = ExecSql(db,
+            "CREATE MOT TABLE twal_idx (id INTEGER PRIMARY KEY, v INTEGER, p TEXT)");
+        TEST_ASSERT(r.rc == SQLITE_OK, "create");
+        for (int i = 1; i <= 100; i++) {
+            char sql[128];
+            snprintf(sql, sizeof(sql),
+                     "INSERT INTO twal_idx VALUES(%d, %d, 'p%d')", i, i * 10, i);
+            ExecSql(db, sql);
+        }
+        r = ExecSql(db, "CREATE INDEX twal_idx_v ON twal_idx(v)");
+        TEST_ASSERT(r.rc == SQLITE_OK, "create index");
+        // In-session the index is backfilled and usable.
+        r = ExecSql(db, "SELECT id FROM twal_idx INDEXED BY twal_idx_v WHERE v = 500");
+        TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "50",
+                    "index works in session 1");
+        sqlite3_close(db);
+    }
+
+    // Session 2: reopen; the index must be repopulated from recovered rows.
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        TEST_ASSERT(db != nullptr, "open 2");
+
+        // Forced index path — if the index were empty this returns 0 rows.
+        auto r = ExecSql(db,
+            "SELECT id FROM twal_idx INDEXED BY twal_idx_v WHERE v = 500");
+        TEST_ASSERT(r.rc == SQLITE_OK, r.errmsg.c_str());
+        TEST_ASSERT(r.rows.size() == 1, "indexed equality finds row after restart");
+        TEST_ASSERT(r.rows[0][0] == "50", "correct id after restart");
+
+        // Forced index range scan.
+        r = ExecSql(db,
+            "SELECT count(*) FROM twal_idx INDEXED BY twal_idx_v "
+            "WHERE v >= 200 AND v < 300");
+        TEST_ASSERT(r.rows[0][0] == "10", "indexed range works after restart");
+
+        // A post-restart insert is still maintained in the index.
+        ExecSql(db, "INSERT INTO twal_idx VALUES(101, 1010, 'new')");
+        r = ExecSql(db,
+            "SELECT id FROM twal_idx INDEXED BY twal_idx_v WHERE v = 1010");
+        TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "101",
+                    "post-restart insert is indexed");
+        sqlite3_close(db);
+    }
+    unlink(path.c_str());
+}
+
 static void TestWalTransactionRollback() {
     std::string path = TempDbPath("rollback");
 
@@ -1031,11 +1233,13 @@ int main(int argc, char* argv[]) {
     RUN_TEST(TestCrossEngineJoin);
     RUN_TEST(TestAggregates);
     RUN_TEST(TestDualEngine);
+    RUN_TEST(TestViewOnMot);
 
     printf("\n[Part 3] Transactions and types\n");
     RUN_TEST(TestTransactionCommit);
     RUN_TEST(TestExplicitRollback);
     RUN_TEST(TestDataTypes);
+    RUN_TEST(TestLargeRecord);
 
     printf("\n[Part 4] CREATE INDEX, triggers, FK, rowid\n");
     RUN_TEST(TestCreateIndex);
@@ -1045,11 +1249,13 @@ int main(int argc, char* argv[]) {
     RUN_TEST(TestForeignKeys);
     RUN_TEST(TestReadYourOwnWrites);
     RUN_TEST(TestCreateIndexBackfill);
+    RUN_TEST(TestReverseIteration);
 
     printf("\n[Part 5] Backup and restore (WAL)\n");
     RUN_TEST(TestWalBasic);
     RUN_TEST(TestWalMultipleTables);
     RUN_TEST(TestWalDeletes);
+    RUN_TEST(TestWalSecondaryIndexRecovery);
     RUN_TEST(TestWalTransactionRollback);
     RUN_TEST(TestWalSurvivesMultipleReopens);
     RUN_TEST(TestWalCheckpointTruncates);
