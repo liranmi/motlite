@@ -7,7 +7,12 @@
 # A row is considered "ack'd" once the writer received "INSERT 0 1" for it,
 # which means psql got a CommandComplete back from oro_server, which means
 # the SQLite txn has fsync'd through the MOT WAL. The expectation is then:
-# after restart, every ack'd id must be visible.
+# after restart, every ack'd id must be visible (missing == 0).
+#
+# Note one in-doubt row is expected and legal: the server may fsync+commit a
+# row and then be killed before its CommandComplete reaches the writer, so the
+# row survives recovery without ever being ack'd. With a single serial writer
+# that is at most one row, so the oracle accepts got == ack or got == ack + 1.
 #
 # Usage:
 #   run_crash_loop.sh [ITERATIONS] [--port N] [--db PATH] [--bin PATH]
@@ -106,12 +111,23 @@ for iter in $(seq 1 "$iters"); do
     "$runner" stop --pidfile "$PIDFILE" >/dev/null
 
     echo "[crash $iter/$iters] delay=${delay_ms}ms ack=${expected} got=${got} missing=${missing}"
-    if [[ "$got" != "$expected" || "$missing" != "0" ]]; then
-        if [[ "$expected" == "0" && "$got" == "0" ]]; then
-            : # writer didn't ack anything before kill — vacuously OK.
-        else
-            fail=$((fail + 1))
-        fi
+    # Pass criteria:
+    #   - missing == 0: every ack'd row survived recovery. This is THE
+    #     durability contract and the only real data-loss signal.
+    #   - got in {ack, ack+1}: a single serial writer can have at most one
+    #     "in-doubt" row — committed and fsync'd by the server, but whose
+    #     CommandComplete never reached the client before kill -9 (so it was
+    #     never ack'd). Such a row legitimately survives recovery, giving
+    #     got = ack + 1. That is correct DB behavior, not a bug, so it must
+    #     not fail the oracle. Anything outside this band (a lost ack'd row,
+    #     a resurrected-but-never-committed row, duplicates, or a failed
+    #     query returning NA) is a genuine failure.
+    if [[ "$got" == "NA" || "$missing" == "NA" ]]; then
+        fail=$((fail + 1))
+    elif [[ "$missing" != "0" ]]; then
+        fail=$((fail + 1))
+    elif [[ "$got" -lt "$expected" || "$got" -gt $((expected + 1)) ]]; then
+        fail=$((fail + 1))
     fi
 done
 
