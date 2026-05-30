@@ -5,7 +5,7 @@
  * The MassTree primary index uses rowid (big-endian uint64) as the key.
  *
  * Internal MOT table layout (per SQLite MOT table):
- *   col 0: data    (BLOB, max 16KB) - the SQLite serialized record bytes
+ *   col 0: data    (BLOB, up to MAX_RECORD_SIZE) - SQLite serialized record bytes
  *   col 1: rowid   (LONG)            - the rowid (also InternalKey)
  */
 
@@ -45,8 +45,18 @@ using namespace MOT;
 // Constants
 // =====================================================================
 
-// Max size for the SQLite record blob stored in MOT
-static constexpr uint32_t MAX_RECORD_SIZE = 4096;
+// Max size for the SQLite record blob stored in MOT.
+//
+// Hard ceiling: MOT enforces MAX_TUPLE_SIZE = 16384 bytes for the *entire*
+// row (sum of all column sizes; see oro-db global.h). The secondary-index
+// table is the tightest consumer — its tuple is
+//   idx_rowid(8) + idx_record(MAX_RECORD_SIZE) + idx_key(IDX_KEY_COL_SIZE=256)
+// plus MOT's null-byte bitmap. So MAX_RECORD_SIZE must stay below
+//   16384 - 8 - 256 - (bitmap/overhead) ≈ 16100.
+// We pick 15360 (15 KB) to leave comfortable headroom while giving ~3.75x the
+// old 4 KB limit. Records larger than this are rejected with an explicit
+// error (see oroMotInsert) rather than failing silently.
+static constexpr uint32_t MAX_RECORD_SIZE = 15360;
 
 // Key length for the primary index (8 bytes uint64)
 static constexpr uint16_t MOT_KEY_LEN = 8;
@@ -1926,6 +1936,67 @@ extern "C" int oroMotWalIsEnabled(void* pDb) {
     return it->second->wal_enabled ? 1 : 0;
 }
 
+// After WAL replay restores the primary MOT tables, repopulate every
+// registered secondary index from the now-recovered rows.
+//
+// Why this is needed (GAPS.md #11, cross-restart): on reopen, schema load
+// re-runs CREATE INDEX, which registers the index in g.sec_indexes and calls
+// oroMotIndexBackfill — but at that point the primary MOT table is still empty
+// (recovery hasn't run yet), so the index is born empty. WAL replay only
+// re-applies primary-table INSERT/DELETE; it never touches secondary indexes.
+// Re-running the existing backfill here (after the primary tables are full)
+// closes the gap. Backfill is idempotent, so this is safe even if some entries
+// already exist.
+static void RecoverSecondaryIndexes(sqlite3* db, OroMotConn* c) {
+    // Snapshot the registered (table, index) identities for the main db so we
+    // don't hold g.mu across SQLite/MOT calls.
+    std::vector<std::pair<std::string, std::string>> idxs;
+    {
+        auto& g = globals();
+        std::lock_guard<std::mutex> lock(g.mu);
+        for (auto& kv : g.sec_indexes) {
+            if (kv.first.iDb == 0) {
+                idxs.emplace_back(kv.first.tabName, kv.first.ixName);
+            }
+        }
+    }
+
+    for (auto& ti : idxs) {
+        // Recover the indexed column names from the loaded schema. PRAGMA
+        // index_info is safe here — unlike the CREATE INDEX codegen path, we
+        // run at a normal statement boundary with the schema fully parsed.
+        std::vector<std::string> cols;
+        char* zPragma = sqlite3_mprintf("PRAGMA index_info(%Q)", ti.second.c_str());
+        if (!zPragma) continue;
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(db, zPragma, -1, &st, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                const char* cn = (const char*)sqlite3_column_text(st, 2); // name
+                if (cn) cols.emplace_back(cn);
+            }
+        }
+        sqlite3_finalize(st);
+        sqlite3_free(zPragma);
+        if (cols.empty()) continue;
+
+        std::vector<const char*> cptrs;
+        cptrs.reserve(cols.size());
+        for (auto& s : cols) cptrs.push_back(s.c_str());
+
+        oroMotIndexBackfill(db, 0, ti.first.c_str(), ti.second.c_str(),
+                            cptrs.data(), (int)cptrs.size());
+
+        // oroMotIndexBackfill opens an index cursor which starts a MOT txn but
+        // does not commit it (in the live path the surrounding VDBE Halt does).
+        // Commit the staged index inserts here.
+        if (c->in_txn) {
+            c->txn->Commit();
+            c->txn->EndTransaction();
+            c->in_txn = false;
+        }
+    }
+}
+
 extern "C" int oroMotWalRecover(void* pDb) {
     if (!pDb) return -1;
     sqlite3* db = (sqlite3*)pDb;
@@ -2008,6 +2079,10 @@ extern "C" int oroMotWalRecover(void* pDb) {
     sqlite3_finalize(sel);
 
     c->wal_replaying = false;
+
+    // Primary tables are now restored; rebuild secondary indexes from them
+    // (they were created empty during schema load, before this replay).
+    RecoverSecondaryIndexes(db, c);
 
     // Keep _mot_wal intact. Replays are idempotent (UNIQUE violations and
     // missing-delete rows are both treated as already-applied), so every

@@ -341,6 +341,41 @@ static void TestDataTypes() {
     TEST_ASSERT(r.rows[0][3] == "DEADBEEF", "blob hex");
 }
 
+// --- Large records (GAPS.md #12) ---
+//
+// MOT caps the whole tuple at MAX_TUPLE_SIZE (16384). The adapter's
+// MAX_RECORD_SIZE was raised from 4096 to 15360, so records up to ~15 KB now
+// round-trip; anything larger must be rejected with an error (not dropped
+// silently).
+static void TestLargeRecord() {
+    SetupDb();
+    auto r = ExecSql(g_db,
+        "CREATE MOT TABLE t_big (id INTEGER PRIMARY KEY, body TEXT)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create");
+
+    // A ~14 KB record: comfortably above the old 4 KB ceiling, below the new
+    // 15 KB one. The serialized record is body length plus a few header bytes.
+    std::string body(14000, 'a');
+    std::string ins = "INSERT INTO t_big VALUES(1, '" + body + "')";
+    r = ExecSql(g_db, ins.c_str());
+    TEST_ASSERT(r.rc == SQLITE_OK, "insert 14KB record");
+
+    r = ExecSql(g_db, "SELECT length(body) FROM t_big WHERE id = 1");
+    TEST_ASSERT(r.rows.size() == 1, "row present");
+    TEST_ASSERT(r.rows[0][0] == "14000", "14KB body length preserved");
+
+    // Over the limit: a ~20 KB record exceeds MAX_RECORD_SIZE and must error
+    // rather than silently vanish.
+    std::string huge(20000, 'b');
+    std::string ins2 = "INSERT INTO t_big VALUES(2, '" + huge + "')";
+    r = ExecSql(g_db, ins2.c_str());
+    TEST_ASSERT(r.rc != SQLITE_OK, "oversize record is rejected with an error");
+
+    // The failed insert left no trace.
+    r = ExecSql(g_db, "SELECT count(*) FROM t_big");
+    TEST_ASSERT(r.rows[0][0] == "1", "only the valid row remains");
+}
+
 // --- Both engines coexist ---
 
 static void TestDualEngine() {
@@ -758,6 +793,66 @@ static void TestWalDeletes() {
     unlink(path.c_str());
 }
 
+// --- Cross-restart secondary index recovery (GAPS.md #11, remaining) ---
+//
+// A secondary index created in one session must still return rows after the
+// process restarts. WAL replay restores the primary table; RecoverSecondaryIndexes
+// must then rebuild the index. INDEXED BY forces the index path so an empty
+// index can't be masked by a full-table scan.
+static void TestWalSecondaryIndexRecovery() {
+    std::string path = TempDbPath("secidx");
+
+    // Session 1: create table, populate, build index, close.
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        TEST_ASSERT(db != nullptr, "open 1");
+        auto r = ExecSql(db,
+            "CREATE MOT TABLE twal_idx (id INTEGER PRIMARY KEY, v INTEGER, p TEXT)");
+        TEST_ASSERT(r.rc == SQLITE_OK, "create");
+        for (int i = 1; i <= 100; i++) {
+            char sql[128];
+            snprintf(sql, sizeof(sql),
+                     "INSERT INTO twal_idx VALUES(%d, %d, 'p%d')", i, i * 10, i);
+            ExecSql(db, sql);
+        }
+        r = ExecSql(db, "CREATE INDEX twal_idx_v ON twal_idx(v)");
+        TEST_ASSERT(r.rc == SQLITE_OK, "create index");
+        // In-session the index is backfilled and usable.
+        r = ExecSql(db, "SELECT id FROM twal_idx INDEXED BY twal_idx_v WHERE v = 500");
+        TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "50",
+                    "index works in session 1");
+        sqlite3_close(db);
+    }
+
+    // Session 2: reopen; the index must be repopulated from recovered rows.
+    {
+        sqlite3* db = OpenPersistent(path.c_str());
+        TEST_ASSERT(db != nullptr, "open 2");
+
+        // Forced index path — if the index were empty this returns 0 rows.
+        auto r = ExecSql(db,
+            "SELECT id FROM twal_idx INDEXED BY twal_idx_v WHERE v = 500");
+        TEST_ASSERT(r.rc == SQLITE_OK, r.errmsg.c_str());
+        TEST_ASSERT(r.rows.size() == 1, "indexed equality finds row after restart");
+        TEST_ASSERT(r.rows[0][0] == "50", "correct id after restart");
+
+        // Forced index range scan.
+        r = ExecSql(db,
+            "SELECT count(*) FROM twal_idx INDEXED BY twal_idx_v "
+            "WHERE v >= 200 AND v < 300");
+        TEST_ASSERT(r.rows[0][0] == "10", "indexed range works after restart");
+
+        // A post-restart insert is still maintained in the index.
+        ExecSql(db, "INSERT INTO twal_idx VALUES(101, 1010, 'new')");
+        r = ExecSql(db,
+            "SELECT id FROM twal_idx INDEXED BY twal_idx_v WHERE v = 1010");
+        TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "101",
+                    "post-restart insert is indexed");
+        sqlite3_close(db);
+    }
+    unlink(path.c_str());
+}
+
 static void TestWalTransactionRollback() {
     std::string path = TempDbPath("rollback");
 
@@ -1036,6 +1131,7 @@ int main(int argc, char* argv[]) {
     RUN_TEST(TestTransactionCommit);
     RUN_TEST(TestExplicitRollback);
     RUN_TEST(TestDataTypes);
+    RUN_TEST(TestLargeRecord);
 
     printf("\n[Part 4] CREATE INDEX, triggers, FK, rowid\n");
     RUN_TEST(TestCreateIndex);
@@ -1050,6 +1146,7 @@ int main(int argc, char* argv[]) {
     RUN_TEST(TestWalBasic);
     RUN_TEST(TestWalMultipleTables);
     RUN_TEST(TestWalDeletes);
+    RUN_TEST(TestWalSecondaryIndexRecovery);
     RUN_TEST(TestWalTransactionRollback);
     RUN_TEST(TestWalSurvivesMultipleReopens);
     RUN_TEST(TestWalCheckpointTruncates);
