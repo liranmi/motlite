@@ -376,6 +376,47 @@ static void TestLargeRecord() {
     TEST_ASSERT(r.rows[0][0] == "1", "only the valid row remains");
 }
 
+// --- Views over MOT tables (GAPS.md #15) ---
+//
+// View resolution happens above the cursor layer, so a native SQLite view
+// over a MOT table (and a view that joins MOT + native tables) should work.
+// This test verifies that previously-unverified gap.
+static void TestViewOnMot() {
+    SetupDb();
+    auto r = ExecSql(g_db,
+        "CREATE MOT TABLE v_sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create mot table");
+    ExecSql(g_db, "INSERT INTO v_sales VALUES(1,'east',100),(2,'west',200),"
+                  "(3,'east',50),(4,'west',75)");
+
+    // Simple view over a MOT table.
+    r = ExecSql(g_db,
+        "CREATE VIEW v_east AS SELECT id, amount FROM v_sales WHERE region='east'");
+    TEST_ASSERT(r.rc == SQLITE_OK, r.errmsg.c_str());
+    r = ExecSql(g_db, "SELECT count(*), sum(amount) FROM v_east");
+    TEST_ASSERT(r.rows[0][0] == "2", "view row count");
+    TEST_ASSERT(r.rows[0][1] == "150", "view sum");
+
+    // Aggregating view with GROUP BY.
+    r = ExecSql(g_db,
+        "CREATE VIEW v_by_region AS "
+        "SELECT region, sum(amount) AS total FROM v_sales GROUP BY region");
+    TEST_ASSERT(r.rc == SQLITE_OK, r.errmsg.c_str());
+    r = ExecSql(g_db, "SELECT total FROM v_by_region WHERE region='west'");
+    TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "275", "grouped view total");
+
+    // View joining a MOT table with a native table.
+    ExecSql(g_db, "CREATE TABLE v_region_info (region TEXT PRIMARY KEY, mgr TEXT)");
+    ExecSql(g_db, "INSERT INTO v_region_info VALUES('east','Ann'),('west','Bob')");
+    r = ExecSql(g_db,
+        "CREATE VIEW v_joined AS "
+        "SELECT s.id, i.mgr FROM v_sales s JOIN v_region_info i ON s.region=i.region");
+    TEST_ASSERT(r.rc == SQLITE_OK, r.errmsg.c_str());
+    r = ExecSql(g_db, "SELECT mgr FROM v_joined WHERE id=2");
+    TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "Bob",
+                "cross-engine view join");
+}
+
 // --- Both engines coexist ---
 
 static void TestDualEngine() {
@@ -509,6 +550,72 @@ static void TestCreateIndexBackfill() {
     r = ExecSql(g_db, "SELECT id FROM t_bf WHERE v = 2010");
     TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "201",
                 "post-CREATE INDEX insert is indexed");
+}
+
+// --- Reverse iteration (GAPS.md #8 / OP_Last & OP_Prev) ---
+//
+// Before this was wired, SELECT max(indexed_col), ORDER BY col DESC, and
+// reverse range scans hit the unwired OP_Last/OP_Prev path and crashed
+// (OP_Last/OP_Prev asserted CURTYPE_BTREE). This verifies the MOT reverse
+// iterator end to end, including the inclusive LE upper bound and non-unique
+// indexes (multiple rowids per key).
+static void TestReverseIteration() {
+    SetupDb();
+    auto r = ExecSql(g_db,
+        "CREATE MOT TABLE t_rev (id INTEGER PRIMARY KEY, v INTEGER)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create");
+    for (int i = 1; i <= 50; i++) {
+        char sql[96];
+        snprintf(sql, sizeof(sql), "INSERT INTO t_rev VALUES(%d, %d)", i, i * 10);
+        ExecSql(g_db, sql);
+    }
+    r = ExecSql(g_db, "CREATE INDEX t_rev_v ON t_rev(v)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create index");
+
+    // max() — uses OP_Last on the index (this used to segfault).
+    r = ExecSql(g_db, "SELECT max(v) FROM t_rev");
+    TEST_ASSERT(r.rows.size() == 1 && r.rows[0][0] == "500", "max(v)=500");
+    // min() — forward scan, sanity.
+    r = ExecSql(g_db, "SELECT min(v) FROM t_rev");
+    TEST_ASSERT(r.rows[0][0] == "10", "min(v)=10");
+
+    // ORDER BY v DESC via the index — reverse full scan.
+    r = ExecSql(g_db, "SELECT v FROM t_rev ORDER BY v DESC");
+    TEST_ASSERT(r.rows.size() == 50, "50 rows desc");
+    TEST_ASSERT(r.rows[0][0] == "500", "first desc = 500");
+    TEST_ASSERT(r.rows[1][0] == "490", "second desc = 490");
+    TEST_ASSERT(r.rows[49][0] == "10", "last desc = 10");
+
+    // Inclusive upper bound (LE) descending — must include the boundary 300.
+    r = ExecSql(g_db, "SELECT v FROM t_rev WHERE v <= 300 ORDER BY v DESC");
+    TEST_ASSERT(r.rows.size() == 30, "30 rows <= 300");
+    TEST_ASSERT(r.rows[0][0] == "300", "LE includes boundary 300");
+    TEST_ASSERT(r.rows[1][0] == "290", "next is 290");
+
+    // Exclusive upper bound (LT) descending — must exclude 300.
+    r = ExecSql(g_db, "SELECT v FROM t_rev WHERE v < 300 ORDER BY v DESC");
+    TEST_ASSERT(r.rows.size() == 29, "29 rows < 300");
+    TEST_ASSERT(r.rows[0][0] == "290", "LT excludes boundary, first = 290");
+
+    // Bounded reverse range.
+    r = ExecSql(g_db,
+        "SELECT v FROM t_rev WHERE v >= 100 AND v <= 200 ORDER BY v DESC");
+    TEST_ASSERT(r.rows.size() == 11, "11 rows in [100,200]");
+    TEST_ASSERT(r.rows[0][0] == "200" && r.rows[10][0] == "100",
+                "reverse range bounds");
+
+    // Non-unique index: several rowids share a key. max/LE must see them all.
+    r = ExecSql(g_db,
+        "CREATE MOT TABLE t_dup (id INTEGER PRIMARY KEY, g INTEGER)");
+    TEST_ASSERT(r.rc == SQLITE_OK, "create dup");
+    ExecSql(g_db, "CREATE INDEX t_dup_g ON t_dup(g)");
+    ExecSql(g_db, "INSERT INTO t_dup VALUES(1,5),(2,5),(3,5),(4,9),(5,9),(6,1)");
+    r = ExecSql(g_db, "SELECT max(g) FROM t_dup");
+    TEST_ASSERT(r.rows[0][0] == "9", "dup max=9");
+    r = ExecSql(g_db, "SELECT count(*) FROM t_dup WHERE g <= 5");
+    TEST_ASSERT(r.rows[0][0] == "4", "dup LE 5 counts 4 (three 5s + one 1)");
+    r = ExecSql(g_db, "SELECT count(*) FROM t_dup WHERE g < 5");
+    TEST_ASSERT(r.rows[0][0] == "1", "dup LT 5 counts 1 (the single 1)");
 }
 
 // --- Rowid allocation after DELETEs ---
@@ -1126,6 +1233,7 @@ int main(int argc, char* argv[]) {
     RUN_TEST(TestCrossEngineJoin);
     RUN_TEST(TestAggregates);
     RUN_TEST(TestDualEngine);
+    RUN_TEST(TestViewOnMot);
 
     printf("\n[Part 3] Transactions and types\n");
     RUN_TEST(TestTransactionCommit);
@@ -1141,6 +1249,7 @@ int main(int argc, char* argv[]) {
     RUN_TEST(TestForeignKeys);
     RUN_TEST(TestReadYourOwnWrites);
     RUN_TEST(TestCreateIndexBackfill);
+    RUN_TEST(TestReverseIteration);
 
     printf("\n[Part 5] Backup and restore (WAL)\n");
     RUN_TEST(TestWalBasic);

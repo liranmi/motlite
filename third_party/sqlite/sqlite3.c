@@ -21229,6 +21229,8 @@ int oroMotCursorOpen(void* pDb, int iDb, const char* table_name, int wrFlag, Oro
 void oroMotCursorClose(OroMotCursor* pCur);
 int oroMotFirst(OroMotCursor* pCur, int* pEof);
 int oroMotNext(OroMotCursor* pCur, int* pEof);
+int oroMotLast(OroMotCursor* pCur, int* pEof);
+int oroMotPrev(OroMotCursor* pCur, int* pEof);
 int oroMotSeekRowid(OroMotCursor* pCur, sqlite3_int64 rowid, int* pRes);
 int oroMotSeekCmp(OroMotCursor* pCur, sqlite3_int64 rowid, int cmp_op, int* pEof);
 int oroMotRowid(OroMotCursor* pCur, sqlite3_int64* pRowid);
@@ -100166,6 +100168,23 @@ case OP_Last: {              /* jump0, ncycle */
   assert( pOp->p1>=0 && pOp->p1<p->nCursor );
   pC = p->apCsr[pOp->p1];
   assert( pC!=0 );
+  /* oro-db: dispatch Last to MOT (e.g. SELECT max(col) and ORDER BY col DESC) */
+  if( pC->eCurType==CURTYPE_MOT ){
+    int eof = 0;
+#ifdef SQLITE_DEBUG
+    pC->seekOp = pOp->opcode;
+#endif
+    rc = oroMotLast((OroMotCursor*)pC->uc.pMotCursor, &eof);
+    pC->nullRow = (u8)eof;
+    pC->deferredMoveto = 0;
+    pC->cacheStatus = CACHE_STALE;
+    if( rc ) goto abort_due_to_error;
+    if( pOp->p2>0 ){
+      VdbeBranchTaken(eof!=0,2);
+      if( eof ) goto jump_to_p2;
+    }
+    break;
+  }
   assert( pC->eCurType==CURTYPE_BTREE );
   pCrsr = pC->uc.pCursor;
   res = 0;
@@ -100387,7 +100406,14 @@ case OP_Prev:          /* jump, ncycle */
   pC = p->apCsr[pOp->p1];
   assert( pC!=0 );
   assert( pC->deferredMoveto==0 );
-  assert( pC->eCurType==CURTYPE_BTREE );
+  assert( pC->eCurType==CURTYPE_BTREE || pC->eCurType==CURTYPE_MOT );
+  /* oro-db: dispatch Prev to MOT (backward scan after OP_Last / SeekLT / SeekLE) */
+  if( pC->eCurType==CURTYPE_MOT ){
+    int eof = 0;
+    rc = oroMotPrev((OroMotCursor*)pC->uc.pMotCursor, &eof);
+    if( rc==0 && eof ) rc = SQLITE_DONE;
+    goto next_tail;
+  }
   assert( pC->seekOp==OP_SeekLT || pC->seekOp==OP_SeekLE
        || pC->seekOp==OP_Last   || pC->seekOp==OP_IfNoHope
        || pC->seekOp==OP_NullRow);
